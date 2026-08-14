@@ -247,12 +247,14 @@ async function leave() {
 
 function openPrompt() {
   $('#chat-prompt').hidden = false
+  document.body.classList.add('prompt-open')
   $('#chat-input').focus()
 }
 
 function closePrompt() {
   $('#chat-input').value = ''
   $('#chat-prompt').hidden = true
+  document.body.classList.remove('prompt-open')
   $('#chat-input').blur()
 }
 
@@ -381,17 +383,82 @@ function escapeHtml(text) {
  *
  * A permanent control bar costs the same pixels whether or not anyone is
  * reaching for it, and in a call those pixels are somebody's face.
+ *
+ * Touch is the exception, and has to be: there is no pointer to move, so a
+ * control that only appears on movement would never appear at all. On those
+ * devices CSS keeps them on permanently and the stage gives up the row.
  */
+const TOUCH = matchMedia('(hover: none)').matches
 let chromeTimer = null
 
 function flashChrome() {
+  if (TOUCH) return
   document.body.classList.add('show-chrome')
   clearTimeout(chromeTimer)
   chromeTimer = setTimeout(() => document.body.classList.remove('show-chrome'), 2400)
 }
 
 document.addEventListener('mousemove', flashChrome)
+
+// A touchscreen laptop reports hover: hover, so the controls fade there like
+// anywhere else — but there is no pointer to move to bring them back. A tap
+// has to count as movement, or those machines are left with no way to reveal
+// them. On a real phone this does nothing, since they never hid.
 document.addEventListener('touchstart', flashChrome, { passive: true })
+
+// ------------------------------------------------------- control height
+
+/**
+ * Publish how tall the control row actually is.
+ *
+ * On touch the controls are permanent, and the stage has to give up exactly
+ * that much room. How much depends on whether they wrapped, which depends on
+ * the width of the phone — so it is measured rather than assumed. A guessed
+ * constant is wrong on the first device that disagrees with it.
+ */
+if (window.ResizeObserver) {
+  const controls = $('#controls')
+  new ResizeObserver(() => {
+    document.documentElement.style.setProperty('--controls-h', `${controls.offsetHeight}px`)
+    stage?.layout()
+  }).observe(controls)
+}
+
+// --------------------------------------------------------------- keyboard
+
+/**
+ * Keep the chat prompt above the virtual keyboard.
+ *
+ * A phone's keyboard slides over the layout without the page being told, so a
+ * prompt pinned to the bottom ends up underneath it and you type into
+ * something you cannot see. The visual viewport does know, and the difference
+ * between it and the window is exactly how much is covered.
+ */
+if (window.visualViewport) {
+  const fitKeyboard = () => {
+    const vv = window.visualViewport
+    const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+    document.documentElement.style.setProperty('--kb', `${covered}px`)
+  }
+  visualViewport.addEventListener('resize', fitKeyboard)
+  visualViewport.addEventListener('scroll', fitKeyboard)
+  fitKeyboard()
+}
+
+/**
+ * Tapping away abandons the message.
+ *
+ * On a phone there is no Escape key, so the gesture has to be the obvious one.
+ * The prompt itself is excluded, and so is the button that opens it — without
+ * that, the very tap that opened the prompt would bubble up here and close it
+ * again before a finger had left the glass.
+ */
+document.addEventListener('pointerdown', (e) => {
+  if ($('#chat-prompt').hidden) return
+  if (e.target.closest('#chat-prompt')) return
+  if (e.target.closest('[data-key="Enter"]')) return
+  closePrompt()
+})
 
 // -------------------------------------------------------------- autoplay
 

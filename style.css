@@ -334,7 +334,11 @@ body.bar-hidden #bar { transform: translateY(-100%); opacity: 0; }
 /* The prompt is a single line at the bottom, like dmenu. */
 #chat-prompt {
   position: absolute;
-  left: 0; right: 0; bottom: 0;
+  left: 0; right: 0;
+  /* --kb is the height the virtual keyboard is covering, measured from the
+     visual viewport. Without it the prompt sits underneath the keyboard on a
+     phone and you type into something you cannot see. */
+  bottom: var(--kb, 0px);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -493,13 +497,50 @@ body.show-chrome #controls { opacity: 1; pointer-events: auto; }
 
 /* -------------------------------------------------------------- mobile -- */
 
+/* A phone cannot show every name; truncate rather than push the rest off. */
+.bar-tags { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 @media (max-width: 700px) {
-  #controls { flex-wrap: wrap; justify-content: center; max-width: 96vw; }
-  #chat-float { bottom: 60px; max-width: 80vw; }
+  #controls { flex-wrap: wrap; justify-content: center; max-width: 96vw; gap: 5px; }
+  #controls .chip { padding: 7px 9px; font-size: 12px; }
+  #chat-float { bottom: 96px; max-width: 78vw; }
   .bar-hint { display: none; }
+
+  /*
+    264px of transcript on a 390px phone leaves a sliver of video, so on a
+    narrow screen the log covers instead of tiling. Reading the log and
+    watching faces are not things anyone does at once on a phone.
+  */
+  #history { width: 100%; border-right: 0; }
+  body.history-open #stage { left: 0; }
 }
 
+/*
+  Touch has no hover and no keyboard, so nothing may depend on either. The
+  controls stay put rather than fading, and the labels that a mouse would
+  reveal are simply always on.
+*/
 @media (hover: none) {
-  /* No hover on touch, so labels stay visible rather than never appearing. */
   .tile-label, .tile-index { opacity: 1; }
+
+  #controls { opacity: 1; pointer-events: auto; }
+
+  /* There is no keyboard to press, so advertising the key list is noise. */
+  .bar-hint { display: none; }
+
+  /*
+    Resident controls must not sit on top of anyone's face, and how tall they
+    are depends on whether they wrapped — which depends on the phone. The
+    height is measured at runtime rather than guessed.
+  */
+  #stage { bottom: calc(var(--controls-h, 48px) + 16px); }
+  #controls { bottom: 8px; }
+
+  /*
+    While typing, the controls go. The keyboard would cover them anyway, every
+    one of them is a tap that abandons the message, and the room they free is
+    the room the prompt needs.
+  */
+  body.prompt-open #controls { display: none; }
+  body.prompt-open #stage { bottom: 56px; }
 }

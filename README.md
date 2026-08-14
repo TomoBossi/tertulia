@@ -44,6 +44,16 @@ shift+Q   leave
 Mouse users are not abandoned — move the mouse and the controls appear — but
 nothing is resident, and nothing has to be.
 
+**On a phone** the same rules would leave you stranded: there is no pointer to
+move and no keyboard to press. So on touch the controls stay put and the stage
+gives up exactly as much room as they occupy, measured at runtime rather than
+guessed, since whether they wrap depends on the handset. Tapping *chat* opens
+the prompt and raises the keyboard; tapping anywhere else abandons the message.
+The prompt rides above the keyboard rather than under it, and the controls step
+aside while you type — every one of them is a tap that would have cancelled the
+message anyway. The log covers the screen instead of tiling beside it, because
+reading chat and watching faces are not things anyone does at once on a phone.
+
 ## Running it
 
 Any static host will do; there is no backend to deploy.
