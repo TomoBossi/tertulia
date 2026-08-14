@@ -37,6 +37,7 @@ i         invite link and QR
 0         unpin
 f         cycle layout: auto, grid, spotlight
 b         show / hide the bar
+d         connection diagnostics
 ?         the list
 shift+Q   leave
 ```
@@ -119,6 +120,15 @@ This is why Zoom and Meet run servers: one upload instead of many. tertulia
 steps video quality down as the room grows, which turns a collapse into a
 gradual softening, but arithmetic is arithmetic. **Audio scales much further** —
 a dozen people cost about 300 kbps.
+
+**Sending more than the other end can decode will kill the call, not soften
+it.** A laptop on good broadband can bury a budget phone: its decoder falls
+behind, frames queue, and because encoding and the keepalives that hold the
+connection open share the same starved CPU and radio, its outbound stops. The
+far end sees a dead peer and tears the call down — while the starved end,
+playing out video that arrived before the break, never notices. tertulia caps
+what it sends and restarts a path that goes quiet, and <kbd>d</kbd> shows the
+transitions if it happens anyway.
 
 **Roughly one pair in eight cannot connect directly.** Usually two mobile
 networks. Instead of a mysterious silence, that peer's tile is badged `relayed`

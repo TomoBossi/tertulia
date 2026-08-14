@@ -418,6 +418,26 @@ body.bar-hidden #bar { transform: translateY(-100%); opacity: 0; }
   font: 12px/1 ui-monospace, Menlo, monospace; padding: 7px 10px;
 }
 
+/* ---------------------------------------------------------- diagnostics -- */
+
+.diag-peer {
+  border-bottom: 1px solid #1c232b;
+  padding: 6px 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.diag-peer b { color: var(--text); }
+
+.diag-log { max-height: 42vh; overflow-y: auto; margin-top: 8px; }
+
+.diag-line { font-size: 11px; line-height: 1.6; white-space: nowrap; }
+.diag-line .t { color: #4b5560; }
+.diag-line .p { color: var(--accent); }
+.diag-line .w { color: var(--text); }
+.diag-line .d { color: var(--muted); }
+
 /* -------------------------------------------------------------- history -- */
 
 /*
@@ -501,8 +521,39 @@ body.show-chrome #controls { opacity: 1; pointer-events: auto; }
 .bar-tags { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 700px) {
-  #controls { flex-wrap: wrap; justify-content: center; max-width: 96vw; gap: 5px; }
-  #controls .chip { padding: 7px 9px; font-size: 12px; }
+  /*
+    One row, always. Wrapping was the wrong tool: it makes the control strip a
+    different height on every handset, which the stage then has to measure and
+    give up, eating video on precisely the screens with least to spare. Letting
+    the buttons share the width instead means seven fit on any phone — they
+    simply get narrower.
+  */
+  #controls {
+    left: 8px; right: 8px;
+    transform: none;
+    max-width: none;
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+
+  #controls .chip {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 9px 2px;
+    font-size: 11.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /*
+    Colour says muted, not a longer word. "mic off" is nearly twice the width
+    of "mic", and since a toggle sizes to its longest label that alone would
+    push the row over on a narrow screen.
+  */
+  #controls .chip.toggle { display: flex; }
+  #controls .chip.toggle .off-label { display: none; }
+  #controls .chip.toggle .on-label { visibility: visible; }
   #chat-float { bottom: 96px; max-width: 78vw; }
   .bar-hint { display: none; }
 

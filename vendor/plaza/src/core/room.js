@@ -40,12 +40,23 @@ export class Room extends Emitter {
    */
   presence = {}
 
+  /**
+   * A rolling record of what the connections have been doing.
+   *
+   * Call failures are almost never observable at the moment someone notices
+   * them — by then the interesting transition is minutes gone. Keeping the
+   * transitions makes a post-mortem possible instead of guesswork.
+   */
+  log = []
+
   #room
   #channels = new Map()
   #rawChannels = new Map()
   #published = new Map()
   #netTimer = null
   #left = false
+  #bitrate = null
+  #restarts = new Map()
 
   constructor(trysteroRoom, { presence = {} } = {}) {
     super()
@@ -164,6 +175,10 @@ export class Room extends Emitter {
       // Raw channels are per peer connection and must be created for each one.
       for (const raw of this.#rawChannels.values()) raw.attach(peerId)
 
+      // A new peer means new senders, which do not inherit the cap.
+      await this.#applyBitrate()
+
+      this.#note(peerId, 'join')
       this.emit('peer:join', peer)
     }
 
@@ -171,9 +186,21 @@ export class Room extends Emitter {
       const peer = this.peers.get(peerId)
       if (!peer) return
       this.peers.delete(peerId)
+      this.#restarts.delete(peerId)
       for (const raw of this.#rawChannels.values()) raw.detach(peerId)
+
+      this.#note(peerId, 'leave', `last seen ${peer.net.state}, path ${peer.net.path ?? '-'}`)
       this.emit('peer:leave', peer)
     }
+  }
+
+  /** Record a connection event, keeping only the recent past. */
+  #note(peerId, what, detail) {
+    const entry = { at: Date.now(), peer: peerId?.slice(0, 6) ?? '-', what, detail }
+    this.log.push(entry)
+    if (this.log.length > 200) this.log.shift()
+    this.emit('log', entry)
+    return entry
   }
 
   #ensure(peerId) {
@@ -432,6 +459,52 @@ export class Room extends Emitter {
     return this.#room.getPeers()
   }
 
+  /**
+   * Cap what we send, per peer.
+   *
+   * Without a cap, WebRTC ramps up to whatever the *sender's* uplink appears
+   * to allow, which says nothing about whether the receiver can decode it. A
+   * laptop on good broadband will happily flood a budget phone until its
+   * decoder falls behind, its frames queue, and — because encoding and the
+   * STUN keepalives share the same starved CPU and radio — its outbound stops
+   * entirely. The far end then sees a dead peer and tears the call down.
+   *
+   * Capping the send rate is the only lever that addresses that directly.
+   * Resolution alone does not: the encoder will spend an unlimited bitrate on
+   * whatever resolution it is given.
+   *
+   * The cap is remembered and reapplied to peers who join later.
+   */
+  async limitBitrate({ video = null, audio = null } = {}) {
+    this.#bitrate = { video, audio }
+    await this.#applyBitrate()
+    return this.#bitrate
+  }
+
+  async #applyBitrate() {
+    if (!this.#bitrate) return
+    const { video, audio } = this.#bitrate
+
+    for (const [peerId, pc] of Object.entries(this.#room.getPeers())) {
+      for (const sender of pc.getSenders()) {
+        const kind = sender.track?.kind
+        const cap = kind === 'video' ? video : kind === 'audio' ? audio : null
+        if (!cap) continue
+
+        try {
+          const params = sender.getParameters()
+          // Firefox hands back parameters with no encodings until the first
+          // negotiation completes; writing one in is harmless and required.
+          if (!params.encodings?.length) params.encodings = [{}]
+          for (const encoding of params.encodings) encoding.maxBitrate = cap * 1000
+          await sender.setParameters(params)
+        } catch (err) {
+          this.#note(peerId, 'bitrate-failed', `${kind}: ${err.message}`)
+        }
+      }
+    }
+  }
+
   // ------------------------------------------------------------- diagnostics
 
   async #pollNet() {
@@ -447,8 +520,43 @@ export class Room extends Emitter {
         net.relayed !== peer.net.relayed ||
         net.path !== peer.net.path
 
+      if (changed) {
+        this.#note(peerId, net.state, `path ${net.path ?? '-'}, rtt ${net.rtt ?? '-'}ms`)
+      }
+
       peer.net = net
       if (changed) this.emit('peer:net', peer, net)
+
+      this.#maybeRestart(peerId, pc, net)
+    }
+  }
+
+  /**
+   * Try to rebuild a path that has gone quiet, before it is too late.
+   *
+   * A disconnected connection is closed for good five seconds later, and
+   * neither peer gets it back — the one that was starved never even learns it
+   * happened, because it is still playing out video that already arrived.
+   * Restarting ICE gathers fresh candidates and renegotiates, which is the
+   * one recovery available, and it only works inside that window.
+   *
+   * Once per episode: a restart storm would make a struggling link worse.
+   */
+  #maybeRestart(peerId, pc, net) {
+    if (net.state !== 'disconnected') {
+      if (net.state === 'connected' || net.state === 'completed') {
+        this.#restarts.delete(peerId)
+      }
+      return
+    }
+    if (this.#restarts.has(peerId)) return
+
+    this.#restarts.set(peerId, Date.now())
+    try {
+      pc.restartIce()
+      this.#note(peerId, 'ice-restart', 'path went quiet; regathering')
+    } catch (err) {
+      this.#note(peerId, 'ice-restart-failed', err.message)
     }
   }
 

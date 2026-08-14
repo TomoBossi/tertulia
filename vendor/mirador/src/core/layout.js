@@ -247,21 +247,31 @@ function fit(x, y, width, height, aspect) {
  * How much video to send, given how many people will receive it.
  *
  * In a mesh every participant uploads one copy per peer, so the cost of your
- * camera is multiplied by the size of the room. Sending 720p to five people is
- * about 7.5 Mbps of upload, which most home connections do not have. Stepping
- * resolution down as the room grows is the difference between a call that
- * degrades gracefully and one that collapses when the fifth person arrives.
+ * camera is multiplied by the size of the room.
+ *
+ * `maxBitrateKbps` matters more than the resolution, and is the field to act
+ * on. Resolution alone caps nothing: an encoder given 720p and no ceiling will
+ * spend as much bandwidth on it as the sender's uplink appears to allow, which
+ * says nothing about whether the *receiver* can decode it. A laptop on good
+ * broadband will happily bury a budget phone, and when that phone's decoder
+ * falls behind, the encoding and the keepalives that hold the connection open
+ * are starved along with it — so the call does not degrade, it dies.
+ *
+ * The ladder is deliberately conservative. Softer video is a mild
+ * disappointment; a dropped call is not, and the sender cannot see which one
+ * it is about to cause.
  *
  * @param {number} peerCount how many others will receive the stream
- * @returns {{width: number, height: number, frameRate: number, estimatedKbps: number}}
+ * @returns {{width: number, height: number, frameRate: number,
+ *            maxBitrateKbps: number, estimatedKbps: number}}
  */
 export function videoProfileFor(peerCount) {
   const others = Math.max(0, peerCount)
 
-  if (others <= 1) return { width: 1280, height: 720, frameRate: 30, estimatedKbps: 1500 }
-  if (others <= 3) return { width: 960, height: 540, frameRate: 30, estimatedKbps: 900 }
-  if (others <= 5) return { width: 640, height: 360, frameRate: 24, estimatedKbps: 500 }
-  return { width: 426, height: 240, frameRate: 15, estimatedKbps: 250 }
+  if (others <= 1) return { width: 960, height: 540, frameRate: 30, maxBitrateKbps: 700, estimatedKbps: 700 }
+  if (others <= 3) return { width: 640, height: 360, frameRate: 30, maxBitrateKbps: 500, estimatedKbps: 500 }
+  if (others <= 5) return { width: 480, height: 270, frameRate: 24, maxBitrateKbps: 350, estimatedKbps: 350 }
+  return { width: 320, height: 180, frameRate: 15, maxBitrateKbps: 200, estimatedKbps: 200 }
 }
 
 /**

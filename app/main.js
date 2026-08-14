@@ -197,6 +197,7 @@ const BINDINGS = {
   h: () => toggleHistory(),
   i: () => toggleOverlay('invite'),
   b: () => document.body.classList.toggle('bar-hidden'),
+  d: () => toggleOverlay('diag'),
   f: () => { session.cycleLayout(); render() },
   '?': () => toggleOverlay('help'),
   '/': () => toggleOverlay('help'),
@@ -314,6 +315,7 @@ function toggleOverlay(name) {
 
   if (name === 'help') showHelp()
   if (name === 'invite') showInvite()
+  if (name === 'diag') showDiag()
 }
 
 function closeOverlay() {
@@ -337,6 +339,7 @@ function showHelp() {
     ['0', 'unpin'],
     ['f', 'layout: auto / grid / spotlight'],
     ['b', 'show / hide the bar'],
+    ['d', 'connection diagnostics'],
     ['?', 'this list'],
     ['shift+Q', 'leave'],
   ]
@@ -346,6 +349,52 @@ function showHelp() {
     keys.map(([k, what]) =>
       `<span class="k">${k}</span><span class="d">${what}</span>`).join('') +
     '</div>'
+}
+
+/**
+ * What the connections have actually been doing.
+ *
+ * A call that fails does so silently and asymmetrically — one side sees a peer
+ * vanish while the other keeps playing video that arrived before the break.
+ * Neither person can describe what happened afterwards, so the transitions
+ * have to be recorded as they occur and readable on the device that saw them.
+ */
+function showDiag() {
+  const { room } = window.tertulia ?? {}
+  if (!room) return
+
+  const peers = [...room.peers.values()].map((p) => {
+    const n = p.net ?? {}
+    return `<div class="diag-peer"><b>${escapeHtml(p.nick || p.id.slice(0, 6))}</b>
+      ${n.state ?? '?'} ${n.path ?? ''} ${n.relayed ? 'RELAYED' : ''}
+      <br>rtt ${n.rtt ?? '-'}ms · in ${n.inboundKbps ?? '-'}kbps · out ${n.outboundKbps ?? '-'}kbps
+      · loss ${n.packetLoss ?? '-'}%</div>`
+  }).join('') || '<div class="diag-peer">nobody connected</div>'
+
+  const log = room.log.slice(-40).reverse().map((e) => {
+    const t = new Date(e.at).toLocaleTimeString()
+    return `<div class="diag-line"><span class="t">${t}</span>
+      <span class="p">${e.peer}</span>
+      <span class="w">${escapeHtml(e.what)}</span>
+      <span class="d">${escapeHtml(e.detail ?? '')}</span></div>`
+  }).join('') || '<div class="diag-line">nothing logged yet</div>'
+
+  $('#overlay-card').innerHTML =
+    `<h2>diagnostics</h2>${peers}<div class="diag-log">${log}</div>
+     <div class="link-row" style="margin-top:10px">
+       <button id="diag-copy" type="button">copy log</button>
+     </div>`
+
+  $('#diag-copy').addEventListener('click', async () => {
+    const text = room.log.map((e) =>
+      `${new Date(e.at).toISOString()} ${e.peer} ${e.what} ${e.detail ?? ''}`).join('\n')
+    try {
+      await navigator.clipboard.writeText(text)
+      $('#diag-copy').textContent = 'copied'
+    } catch {
+      $('#diag-copy').textContent = 'could not copy'
+    }
+  })
 }
 
 function showInvite() {

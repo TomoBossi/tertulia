@@ -69,7 +69,15 @@ export class CallSession extends Emitter {
       this.speakers.remove(peer.id)
       this.#greeted.delete(peer.id)
       if (this.pinned === peer.id) this.pinned = null
-      this.emit('notice', `${peer.nick || 'someone'} left`)
+
+      // A peer that was mid-call and never reached a healthy state did not
+      // leave, it was lost — and saying "left" for both hides the failure that
+      // is worth knowing about. The other end may not even have noticed yet.
+      const dropped = peer.net?.state === 'disconnected' || peer.net?.state === 'failed'
+      this.emit('notice', dropped
+        ? `${peer.nick || 'someone'} dropped — connection lost, not a goodbye`
+        : `${peer.nick || 'someone'} left`)
+
       this.#adaptQuality()
       this.emit('change')
     })
@@ -171,6 +179,12 @@ export class CallSession extends Emitter {
   async #adaptQuality() {
     const others = this.room.peers.size
     const profile = videoProfileFor(others)
+
+    // The ceiling matters more than the resolution. Constraining the capture
+    // asks the camera for fewer pixels; capping the sender is what stops the
+    // encoder spending an unbounded bitrate on whatever pixels it gets, and
+    // burying a receiver that cannot decode that fast.
+    await this.room.limitBitrate({ video: profile.maxBitrateKbps, audio: 48 })
 
     for (const track of this.media.stream?.getVideoTracks() ?? []) {
       try {
