@@ -31,10 +31,21 @@
 <!-- ------------------------------------------------------------ landing -->
 <main id="landing">
   <div class="landing-inner">
-    <h1>tertulia</h1>
-    <p class="tagline">A video call with no server, no account and no install.
-       Type the same code as your friends and you are connected directly to
-       each other.</p>
+    <header class="entry">
+      <h1>tertulia<span class="etym">De or. inc.</span></h1>
+      <p class="sense">
+        <span class="num">1.</span> <i>f.</i> Reunión de personas que se juntan
+        habitualmente para conversar sobre algún tema.
+      </p>
+      <p class="syn">
+        <span class="lbl">Sin.:</span> reunión, conversación, charla, coloquio,
+        corrillo, grupo, círculo, velada.
+      </p>
+    </header>
+
+    <p class="tagline">Join video calls with no server, no account, and no
+       install. Type the same room code as your peers and you will be directly
+       connected to each other.</p>
 
     <div class="preview-wrap">
       <video id="preview" autoplay muted playsinline></video>
@@ -56,22 +67,13 @@
 
     <form id="join-form">
       <div class="room-row">
-        <input id="room-input" autocomplete="off" spellcheck="false" placeholder="amber-otter-42" aria-label="Room">
+        <input id="room-input" autocomplete="off" spellcheck="false" placeholder="room code" aria-label="Room code">
         <button id="regenerate" type="button" title="new code">↻</button>
       </div>
-      <input id="nick-input" autocomplete="nickname" maxlength="40" placeholder="your name" aria-label="Your name">
+      <input id="nick-input" autocomplete="nickname" maxlength="40" placeholder="username" aria-label="Username">
       <button id="join-button" type="submit" class="primary">join</button>
       <p id="landing-error" class="error"></p>
     </form>
-
-    <p class="note">
-      Peer-to-peer. Nothing is stored and nobody can record it centrally,
-      because there is no centre. Four on video is comfortable; audio scales
-      much further.
-      <br><br>
-      Once you are in, everything is on the keyboard. Press <kbd>?</kbd> for the
-      list.
-    </p>
   </div>
 </main>
 

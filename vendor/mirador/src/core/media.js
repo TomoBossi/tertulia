@@ -61,8 +61,14 @@ export class LocalMedia extends Emitter {
     try {
       stream = await navigator.mediaDevices.getUserMedia(constraints)
     } catch (err) {
-      this.emit('error', describeMediaError(err, { audio, video }))
-      throw err
+      // The described error is thrown, not just emitted. Throwing the raw one
+      // means any caller using try/catch shows "Permission denied" while
+      // listeners get the sentence explaining where to fix it — the same
+      // failure told two different ways depending on how you happened to
+      // listen. The original is preserved as `cause`.
+      const described = describeMediaError(err, { audio, video })
+      this.emit('error', described)
+      throw described
     }
 
     this.#adopt(stream)
@@ -165,8 +171,11 @@ export class LocalMedia extends Emitter {
       // A user who changes their mind at the picker is not an error worth
       // reporting; it arrives as NotAllowedError exactly like a denied
       // permission, so it has to be distinguished by intent, not by name.
-      if (err.name !== 'NotAllowedError') this.emit('error', describeMediaError(err, { screen: true }))
-      throw err
+      if (err.name === 'NotAllowedError') throw err
+
+      const described = describeMediaError(err, { screen: true })
+      this.emit('error', described)
+      throw described
     }
 
     this.screenStream = stream

@@ -81,8 +81,46 @@ kbd {
 
 .landing-inner { width: 100%; max-width: 420px; }
 
-#landing h1 { margin: 0; font-size: 28px; letter-spacing: -0.5px; font-weight: 650; }
-.tagline { color: var(--muted); margin: 6px 0 18px; font-size: 14px; }
+/*
+  The title is set as a dictionary entry, because the word is doing the
+  explaining. A serif face and the Academy's own conventions — etymology,
+  numbered sense with its grammatical category, a synonym list — say what the
+  application is more precisely than a slogan would, and the switch to serif
+  makes it read as a quotation rather than as branding.
+*/
+.entry {
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+}
+
+#landing h1 {
+  margin: 0 0 2px;
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.etym {
+  font-size: 12px;
+  font-weight: 400;
+  font-style: italic;
+  color: #5f6a76;
+  letter-spacing: 0;
+}
+
+.sense { margin: 8px 0 0; font-size: 14.5px; line-height: 1.55; color: #c3ccd6; }
+.sense .num { font-weight: 700; color: var(--muted); }
+.sense i { color: var(--muted); }
+
+.syn { margin: 8px 0 0; font-size: 13px; line-height: 1.55; color: #6c7683; }
+.syn .lbl { font-variant: small-caps; letter-spacing: .4px; color: var(--accent); }
+
+.tagline { color: var(--muted); margin: 0 0 18px; font-size: 13.5px; line-height: 1.6; }
 
 .preview-wrap {
   position: relative;
@@ -115,7 +153,6 @@ kbd {
 #regenerate { flex: 0 0 auto; }
 
 .error { color: var(--bad); font-size: 13px; margin: 0; min-height: 1em; }
-.note { margin-top: 18px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
 
 .chip {
   border-radius: 999px;
