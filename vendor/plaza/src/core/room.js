@@ -1,0 +1,515 @@
+import { joinRoom as trysteroJoin, selfId } from '../../vendor/trystero.mjs'
+import { Emitter } from './emitter.js'
+import { watchConnection } from './diagnostics.js'
+
+/**
+ * A room: the people in it, what they are broadcasting about themselves, and
+ * the channels anything else can talk over.
+ *
+ * plaza is the substrate, not the application. It knows how to get people
+ * connected and how to move bytes between them; it has no opinion about what
+ * those bytes mean. There is no concept of a camera, a mute button or a game
+ * in this file, and there should never be one — those belong to the layers
+ * above, and keeping them out is what lets a video call and a chess app share
+ * the same foundation.
+ *
+ * Nothing here touches the DOM either. The library hands you `MediaStream`
+ * objects and tells you when things change; rendering is somebody else's job.
+ *
+ * @fires peer:join    (peer)
+ * @fires peer:leave   (peer)
+ * @fires peer:update  (peer)                presence changed
+ * @fires peer:stream  (peer, stream, kind)  stream arrived, or null if ended
+ * @fires peer:net     (peer, net)           connection quality changed
+ * @fires chat         (message)
+ * @fires error        (error)
+ */
+export class Room extends Emitter {
+  /** Our own peer id. Stable for the lifetime of the page. */
+  selfId = selfId
+
+  /** @type {Map<string, Peer>} everyone else in the room */
+  peers = new Map()
+
+  /**
+   * Whatever we are telling the room about ourselves.
+   *
+   * plaza does not interpret any of it. A call layer might put mute state in
+   * here; a game might put a chosen colour. Anything JSON-serialisable works,
+   * and it is re-sent automatically to anyone who joins later.
+   */
+  presence = {}
+
+  #room
+  #channels = new Map()
+  #rawChannels = new Map()
+  #published = new Map()
+  #netTimer = null
+  #left = false
+
+  constructor(trysteroRoom, { presence = {} } = {}) {
+    super()
+    this.#room = trysteroRoom
+    this.presence = { ...presence }
+
+    this.#wirePresence()
+    this.#wireStreams()
+    this.#wireChat()
+    this.#wirePeers()
+
+    // Connection quality has no events in the underlying API, so it is polled.
+    // Two seconds notices a peer degrading without draining a phone battery.
+    this.#netTimer = setInterval(() => this.#pollNet(), 2000)
+  }
+
+  /**
+   * Join a room.
+   *
+   * Everyone who passes the same `room` string ends up connected to each
+   * other. The string is hashed before it reaches the relay network, so the
+   * code your users type never becomes visible to whoever runs the relays.
+   *
+   * `password` additionally encrypts the connection handshake, which is worth
+   * setting: the handshake carries ICE candidates, and ICE candidates carry
+   * the IP address of everyone in the room.
+   */
+  static async join({ room, appId = 'plaza', password, nick, presence, rtcConfig } = {}) {
+    if (!room || !String(room).trim()) {
+      throw new Error('plaza: a room name is required')
+    }
+
+    // A display name is presence like any other, but it is the field every
+    // application ends up wanting, so it gets a shortcut rather than making
+    // everyone reach into the bag for it.
+    const initial = { ...(nick ? { nick: String(nick).slice(0, 60) } : {}), ...(presence ?? {}) }
+
+    const tr = trysteroJoin(
+      {
+        appId,
+        ...(password ? { password } : {}),
+        ...(rtcConfig ? { rtcConfig } : {}),
+      },
+      String(room).trim(),
+    )
+
+    return new Room(tr, { presence: initial })
+  }
+
+  // ---------------------------------------------------------------- presence
+
+  #wirePresence() {
+    this.#hello = this.#room.makeAction('plz.hello')
+    this.#hello.onMessage = (data, { peerId }) => {
+      const peer = this.#ensure(peerId)
+      peer.presence = data && typeof data === 'object' ? data : {}
+      // Mirrored onto the peer so callers can write peer.nick without
+      // reaching through presence for the one field they always want.
+      peer.nick = String(peer.presence.nick ?? '').slice(0, 60)
+      this.emit('peer:update', peer)
+    }
+  }
+
+  #hello
+
+  /**
+   * Replace what we are broadcasting about ourselves.
+   *
+   * Presence is sent whole rather than as a patch. It is small, it arrives
+   * rarely, and a peer that missed one update would otherwise be permanently
+   * out of step with no way to notice.
+   */
+  setPresence(next) {
+    this.presence = { ...(next ?? {}) }
+    this.#announce()
+    this.emit('self', this.presence)
+    return this.presence
+  }
+
+  /** Merge fields into presence, leaving the rest alone. */
+  updatePresence(patch) {
+    return this.setPresence({ ...this.presence, ...(patch ?? {}) })
+  }
+
+  /** This peer's display name, if it has set one. */
+  get nick() {
+    return this.presence?.nick ?? ''
+  }
+
+  /**
+   * Set a display name.
+   *
+   * Shorthand for updating the `nick` field of presence, which is where it
+   * lives — plaza has no notion of identity beyond what peers choose to say
+   * about themselves.
+   */
+  setNick(nick) {
+    return this.updatePresence({ nick: String(nick ?? '').slice(0, 60) })
+  }
+
+  #announce(target) {
+    this.#hello.send(this.presence, target ? { target } : undefined).catch(() => {})
+  }
+
+  // ------------------------------------------------------------------- peers
+
+  #wirePeers() {
+    this.#room.onPeerJoin = async (peerId) => {
+      const peer = this.#ensure(peerId)
+
+      // Someone arriving late has missed everything said so far, so both our
+      // identity and our streams are repeated privately for them.
+      this.#announce(peerId)
+      await this.#resendStreams(peerId)
+
+      // Raw channels are per peer connection and must be created for each one.
+      for (const raw of this.#rawChannels.values()) raw.attach(peerId)
+
+      this.emit('peer:join', peer)
+    }
+
+    this.#room.onPeerLeave = (peerId) => {
+      const peer = this.peers.get(peerId)
+      if (!peer) return
+      this.peers.delete(peerId)
+      for (const raw of this.#rawChannels.values()) raw.detach(peerId)
+      this.emit('peer:leave', peer)
+    }
+  }
+
+  #ensure(peerId) {
+    let peer = this.peers.get(peerId)
+    if (!peer) {
+      peer = {
+        id: peerId,
+        nick: '',
+        presence: {},
+        /** streams by kind, whatever kinds the application chooses to send */
+        streams: {},
+        net: { state: 'connecting', path: null, relayed: false, rtt: null },
+        joinedAt: Date.now(),
+      }
+      this.peers.set(peerId, peer)
+    }
+    return peer
+  }
+
+  // ----------------------------------------------------------------- streams
+
+  #wireStreams() {
+    this.#room.onPeerStream = (stream, peerId, metadata) => {
+      const peer = this.#ensure(peerId)
+      const kind = metadata?.kind ?? 'default'
+
+      peer.streams[kind] = stream
+      this.emit('peer:stream', peer, stream, kind)
+      this.emit('peer:update', peer)
+
+      // A remote stream stops by its tracks ending, not by a message, so the
+      // only reliable notice that someone stopped sharing is this.
+      for (const track of stream.getTracks()) {
+        track.addEventListener('ended', () => {
+          if (peer.streams[kind] !== stream) return
+          if (stream.getTracks().some((t) => t.readyState === 'live')) return
+
+          delete peer.streams[kind]
+          this.emit('peer:stream', peer, null, kind)
+          this.emit('peer:update', peer)
+        })
+      }
+    }
+  }
+
+  /**
+   * Send a stream to the room.
+   *
+   * `kind` is an opaque label echoed back to receivers, which use it to tell a
+   * camera from a screen share — or from anything else an application invents.
+   * plaza never inspects it.
+   */
+  addStream(stream, { kind = 'default', target } = {}) {
+    if (!stream) return
+    if (!target) this.#published.set(stream, kind)
+
+    return this.#room.addStream(stream, {
+      metadata: { kind },
+      ...(target ? { target } : {}),
+    })
+  }
+
+  removeStream(stream) {
+    if (!stream) return
+    this.#published.delete(stream)
+    try { this.#room.removeStream(stream) } catch { /* never sent */ }
+  }
+
+  /**
+   * Swap one track for another on every peer connection.
+   *
+   * Used when switching camera or microphone. Replacing the track on the
+   * existing sender avoids renegotiating the connection, so nobody else's
+   * video stutters because one person changed webcam.
+   */
+  replaceTrack(oldTrack, newTrack) {
+    try {
+      return this.#room.replaceTrack(oldTrack, newTrack)
+    } catch (err) {
+      console.warn('plaza: replaceTrack failed', err)
+    }
+  }
+
+  async #resendStreams(peerId) {
+    const jobs = []
+    for (const [stream, kind] of this.#published) {
+      jobs.push(this.#room.addStream(stream, { target: peerId, metadata: { kind } }))
+    }
+    await Promise.allSettled(jobs.flat())
+  }
+
+  // -------------------------------------------------------------------- chat
+
+  #wireChat() {
+    this.#chatAction = this.#room.makeAction('plz.chat')
+    this.#chatAction.onMessage = (data, { peerId }) => {
+      const peer = this.#ensure(peerId)
+      this.emit('chat', {
+        from: peerId,
+        nick: peer.nick || peerId.slice(0, 6),
+        text: String(data?.text ?? '').slice(0, 2000),
+        at: Date.now(),
+        self: false,
+      })
+    }
+  }
+
+  #chatAction
+
+  /**
+   * Send a chat message.
+   *
+   * Chat lives in plaza rather than a call layer because text is not a call
+   * feature — a game room wants it just as much. It is a thin convention over
+   * a channel, and any application wanting different semantics can ignore it
+   * and open its own.
+   */
+  chat(text) {
+    const clean = String(text ?? '').trim().slice(0, 2000)
+    if (!clean) return null
+
+    this.#chatAction.send({ text: clean }).catch(() => {})
+
+    const msg = {
+      from: this.selfId,
+      nick: this.nick || 'you',
+      text: clean,
+      at: Date.now(),
+      self: true,
+    }
+    this.emit('chat', msg)
+    return msg
+  }
+
+  // ---------------------------------------------------------------- channels
+
+  /**
+   * Open a named channel for application data — a game's moves, a shared
+   * cursor, anything.
+   *
+   * Delivery is reliable and ordered, which is exactly right for turn-based
+   * play: a move must arrive, and must arrive after the one before it. For
+   * anything realtime enough to prefer a dropped update over a late one, use
+   * {@link Room#dataChannel} instead.
+   */
+  channel(name) {
+    const key = String(name)
+    const existing = this.#channels.get(key)
+    if (existing) return existing
+
+    const action = this.#room.makeAction(shortName(key))
+    const emitter = new Emitter()
+    action.onMessage = (data, { peerId }) => emitter.emit('message', data, peerId)
+
+    const channel = {
+      name: key,
+      send: (data, target) => action.send(data, target ? { target } : undefined).catch(() => {}),
+      on: (event, fn) => emitter.on(event, fn),
+      close: () => {
+        emitter.clearListeners()
+        this.#channels.delete(key)
+      },
+    }
+
+    this.#channels.set(key, channel)
+    return channel
+  }
+
+  /**
+   * Open a raw, optionally unreliable data channel to every peer.
+   *
+   * This is the escape hatch for realtime netcode. Reliable ordered delivery
+   * is the wrong shape for rollback: a retransmission costs a full round trip
+   * — precisely the latency rollback exists to hide — and one lost packet
+   * stalls every later frame behind it. Such a system wants
+   * `{ordered: false, maxRetransmits: 0}` and repeats its own state instead.
+   *
+   * The channel is created with `negotiated: true` and an id derived from the
+   * label, so both sides construct it identically with no offer/answer
+   * exchange. Without that, opening a channel mid-session would renegotiate
+   * the peer connection and interrupt any media already flowing.
+   */
+  dataChannel(label, opts = {}) {
+    const key = String(label)
+    const existing = this.#rawChannels.get(key)
+    if (existing) return existing.handle
+
+    const id = channelId(key)
+    const config = {
+      negotiated: true,
+      id,
+      ordered: opts.ordered ?? false,
+      ...(opts.maxPacketLifeTime != null
+        ? { maxPacketLifeTime: opts.maxPacketLifeTime }
+        : { maxRetransmits: opts.maxRetransmits ?? 0 }),
+    }
+
+    const emitter = new Emitter()
+    const channels = new Map()
+
+    const attach = (peerId) => {
+      if (channels.has(peerId)) return
+      const pc = this.#room.getPeers()[peerId]
+      if (!pc) return
+
+      let dc
+      try {
+        dc = pc.createDataChannel(key, config)
+      } catch (err) {
+        console.warn(`plaza: could not open raw channel "${key}" to ${peerId}`, err)
+        return
+      }
+
+      dc.binaryType = 'arraybuffer'
+      dc.addEventListener('open', () => emitter.emit('open', peerId, dc))
+      dc.addEventListener('close', () => emitter.emit('close', peerId))
+      dc.addEventListener('message', (e) => emitter.emit('message', peerId, e.data))
+      channels.set(peerId, dc)
+    }
+
+    const detach = (peerId) => {
+      const dc = channels.get(peerId)
+      if (!dc) return
+      channels.delete(peerId)
+      try { dc.close() } catch { /* already closed */ }
+    }
+
+    const handle = {
+      label: key,
+      id,
+      peers: () => [...channels.keys()],
+      send: (peerId, data) => {
+        const dc = channels.get(peerId)
+        if (dc?.readyState === 'open') dc.send(data)
+      },
+      broadcast: (data) => {
+        for (const dc of channels.values()) {
+          if (dc.readyState === 'open') dc.send(data)
+        }
+      },
+      on: (event, fn) => emitter.on(event, fn),
+      close: () => {
+        for (const peerId of [...channels.keys()]) detach(peerId)
+        emitter.clearListeners()
+        this.#rawChannels.delete(key)
+      },
+    }
+
+    this.#rawChannels.set(key, { handle, attach, detach })
+    for (const peerId of this.peers.keys()) attach(peerId)
+    return handle
+  }
+
+  /** The underlying RTCPeerConnections, keyed by peer id. */
+  connections() {
+    return this.#room.getPeers()
+  }
+
+  // ------------------------------------------------------------- diagnostics
+
+  async #pollNet() {
+    if (this.#left) return
+
+    for (const [peerId, pc] of Object.entries(this.#room.getPeers())) {
+      const peer = this.peers.get(peerId)
+      if (!peer) continue
+
+      const net = await watchConnection(pc)
+      const changed =
+        net.state !== peer.net.state ||
+        net.relayed !== peer.net.relayed ||
+        net.path !== peer.net.path
+
+      peer.net = net
+      if (changed) this.emit('peer:net', peer, net)
+    }
+  }
+
+  /** Measure round-trip time to a peer. */
+  async ping(peerId) {
+    try {
+      return await this.#room.ping(peerId)
+    } catch {
+      return null
+    }
+  }
+
+  // ---------------------------------------------------------------- teardown
+
+  async leave() {
+    if (this.#left) return
+    this.#left = true
+
+    clearInterval(this.#netTimer)
+    for (const channel of [...this.#channels.values()]) channel.close()
+    for (const raw of [...this.#rawChannels.values()]) raw.handle.close()
+
+    this.#published.clear()
+    try { await this.#room.leave() } catch { /* already gone */ }
+
+    this.peers.clear()
+    this.clearListeners()
+  }
+}
+
+/** Convenience alias matching the package entry point. */
+export const join = Room.join.bind(Room)
+
+/**
+ * Trystero caps action names at 32 bytes. Rather than push that limit onto
+ * every caller, anything longer folds into a short deterministic token — so an
+ * application can name its channel whatever it likes and two differently named
+ * channels still never collide.
+ */
+function shortName(name) {
+  const bytes = new TextEncoder().encode(name)
+  if (bytes.length <= 32) return name
+  return `x${hash32(name).toString(36)}`
+}
+
+/**
+ * Derive a stable SCTP stream id from a label.
+ *
+ * Both peers must choose the same number without discussing it, which a hash
+ * gives for free. Ids start at 1000 to stay clear of the low, sequentially
+ * assigned ids that in-band negotiated channels use.
+ */
+function channelId(label) {
+  return 1000 + (hash32(label) % 60000)
+}
+
+function hash32(str) {
+  let h = 2166136261
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}

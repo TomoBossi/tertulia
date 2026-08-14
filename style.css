@@ -1,0 +1,405 @@
+:root {
+  --bg: #0b0d10;
+  --panel: #14181d;
+  --line: #232a33;
+  --text: #e6edf3;
+  --muted: #7d8894;
+  --accent: #4a9eff;
+  --good: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+  --bar: 22px;
+}
+
+* { box-sizing: border-box; }
+
+/*
+  The hidden attribute sets display:none from the user-agent stylesheet, which
+  any display rule of our own silently beats. Every element here that toggles
+  with `hidden` also has a display — so without this the landing screen stays
+  visible underneath the call, and the overlay never goes away.
+*/
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select { font: inherit; color: inherit; }
+
+button {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: #1a2027;
+  border-radius: 6px;
+  padding: 6px 12px;
+}
+
+button:hover { background: #222a33; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+button.primary:disabled { opacity: .5; cursor: default; }
+
+input, select {
+  background: #0e1216;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 11px;
+  font-size: 16px; /* 16px or iOS zooms the page on focus */
+  width: 100%;
+}
+
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+kbd {
+  background: #1a2027;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 5px;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ------------------------------------------------------------- landing -- */
+
+#landing {
+  height: 100dvh;
+  overflow-y: auto;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+}
+
+.landing-inner { width: 100%; max-width: 420px; }
+
+#landing h1 { margin: 0; font-size: 28px; letter-spacing: -0.5px; font-weight: 650; }
+.tagline { color: var(--muted); margin: 6px 0 18px; font-size: 14px; }
+
+.preview-wrap {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+#preview { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+
+#preview-placeholder {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  color: var(--muted); font-size: 13px; text-align: center; padding: 20px;
+}
+
+.preview-controls {
+  position: absolute; left: 0; right: 0; bottom: 10px;
+  display: flex; justify-content: center; gap: 6px;
+}
+
+.device-row { display: flex; gap: 6px; margin-top: 8px; }
+.device-row select { font-size: 13px; padding: 6px 8px; }
+
+#join-form { margin-top: 14px; display: grid; gap: 8px; }
+.room-row { display: flex; gap: 6px; }
+.room-row input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#regenerate { flex: 0 0 auto; }
+
+.error { color: var(--bad); font-size: 13px; margin: 0; min-height: 1em; }
+.note { margin-top: 18px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+
+.chip {
+  border-radius: 999px;
+  font-size: 12.5px;
+  padding: 5px 12px;
+  background: #000a;
+  border-color: #ffffff22;
+}
+
+.chip:hover { background: #000c; }
+.chip.off { background: #f851491f; border-color: #f8514966; color: #ff9b95; }
+.chip.active { background: #4a9eff22; border-color: #4a9eff88; color: var(--accent); }
+.chip.danger { border-color: #f8514955; color: #ff9b95; }
+.chip .off-label { display: none; }
+.chip.off .on-label { display: none; }
+.chip.off .off-label { display: inline; }
+
+/* ---------------------------------------------------------------- call -- */
+
+/*
+  The video is the app. Everything else floats above it and gets out of the
+  way — no permanent header, no sidebar, no control bar reserving space.
+*/
+#call { position: fixed; inset: 0; }
+
+/* The bar reserves its row, the way a tiling window manager's does, so it
+   never sits on top of anyone's face. Hiding it gives the row back. */
+#stage {
+  position: absolute;
+  inset: var(--bar) 0 0 0;
+  transition: top .15s ease;
+}
+
+body.bar-hidden #stage { top: 0; }
+
+.tile {
+  position: absolute;
+  top: 0; left: 0;
+  background: #000;
+  border-radius: 6px;
+  overflow: hidden;
+  outline: 1px solid #ffffff14;
+  outline-offset: -1px;
+  /* Transform rather than top/left so moves composite instead of re-laying out */
+  transition: transform .2s ease, width .2s ease, height .2s ease, box-shadow .15s;
+}
+
+.tile video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tile.screen video { object-fit: contain; background: #000; }
+.tile.speaking { box-shadow: inset 0 0 0 2px var(--good); }
+
+.tile-placeholder {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  background: #12171c;
+  color: #5b6773;
+  font-size: clamp(20px, 6vw, 44px);
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+/* Labels only appear on hover, or while the bar is showing. A name burned
+   permanently onto every tile is exactly the clutter this design avoids. */
+.tile-label {
+  position: absolute; left: 6px; bottom: 6px;
+  background: #000a;
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-size: 11.5px;
+  max-width: calc(100% - 12px);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  opacity: 0;
+  transition: opacity .15s;
+}
+
+.tile:hover .tile-label,
+body.show-chrome .tile-label { opacity: 1; }
+
+.tile-badges { position: absolute; right: 6px; top: 6px; display: flex; gap: 4px; }
+
+.tile-badges span {
+  background: #000a; border-radius: 4px; padding: 1px 6px;
+  font-size: 10.5px; color: var(--muted);
+}
+
+.tile-badges .warn { color: var(--warn); }
+.tile-badges .bad { color: var(--bad); }
+
+.tile-index {
+  position: absolute; left: 6px; top: 6px;
+  background: #000a; border-radius: 4px;
+  padding: 0 5px; font-size: 10.5px;
+  font-family: ui-monospace, Menlo, monospace;
+  color: var(--muted);
+  opacity: 0; transition: opacity .15s;
+}
+
+.tile:hover .tile-index,
+body.show-chrome .tile-index { opacity: 1; }
+.tile.pinned .tile-index { opacity: 1; color: var(--accent); }
+
+/* ----------------------------------------------------------------- bar -- */
+
+/*
+  One row, 22px, no padding worth mentioning — dwm's bar, not a toolbar.
+  Toggle with b. The stage does not resize when it hides, because the video
+  is already using the whole viewport and the bar simply sits on top.
+*/
+#bar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: var(--bar);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+  background: #000000b0;
+  backdrop-filter: blur(6px);
+  font: 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  z-index: 5;
+  transition: transform .15s ease, opacity .15s ease;
+}
+
+body.bar-hidden #bar { transform: translateY(-100%); opacity: 0; }
+
+.bar-room { color: var(--accent); }
+.bar-spacer { flex: 1; }
+.bar-tags { color: var(--text); }
+.bar-state .off { color: var(--bad); }
+.bar-net .warn { color: var(--warn); }
+.bar-net .bad { color: var(--bad); }
+.bar-hint { opacity: .5; }
+
+/* ---------------------------------------------------------------- chat -- */
+
+/* Recent lines float over the video and fade out. No panel, no reserved space. */
+#chat-float {
+  position: absolute;
+  left: 10px;
+  bottom: 46px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: min(46ch, 60vw);
+  z-index: 4;
+  pointer-events: none;
+}
+
+.float-line {
+  background: #000000b8;
+  border-radius: 5px;
+  padding: 3px 9px;
+  font-size: 13px;
+  width: fit-content;
+  animation: floatIn .16s ease;
+  transition: opacity .6s ease;
+}
+
+.float-line.system { color: var(--muted); font-style: italic; font-size: 12px; }
+.float-line .who { font-weight: 600; color: var(--accent); margin-right: 6px; }
+.float-line.self .who { color: var(--good); }
+.float-line.stale { opacity: 0; }
+
+@keyframes floatIn { from { opacity: 0; transform: translateY(4px); } }
+
+/* The prompt is a single line at the bottom, like dmenu. */
+#chat-prompt {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #000000d8;
+  backdrop-filter: blur(6px);
+  z-index: 6;
+}
+
+.prompt-label {
+  font: 12px/1 ui-monospace, Menlo, monospace;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+#chat-input {
+  background: transparent;
+  border: 0;
+  padding: 4px 0;
+  font-size: 15px;
+}
+
+#chat-input:focus { outline: none; }
+
+/* ------------------------------------------------------------- overlay -- */
+
+#overlay {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  background: #000000a8;
+  backdrop-filter: blur(3px);
+  z-index: 8;
+  padding: 20px;
+}
+
+#overlay-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px;
+  max-width: 460px;
+  width: 100%;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+#overlay-card h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase;
+                   letter-spacing: .6px; color: var(--muted); }
+
+.keys { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13.5px; }
+.keys kbd { justify-self: start; }
+
+.roster-row {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 6px 8px; border-radius: 6px; font-size: 13.5px; cursor: pointer;
+}
+
+.roster-row:hover { background: #1c232b; }
+.roster-row.pinned { background: #4a9eff1a; box-shadow: inset 2px 0 0 var(--accent); }
+.roster-marks { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+#invite-qr { background: #fff; padding: 10px; border-radius: 8px; display: block;
+             width: 190px; margin: 0 auto 12px; line-height: 0; }
+#invite-qr svg { width: 170px; height: 170px; display: block; }
+
+.link-row { display: flex; gap: 6px; }
+.link-row input { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+.link-row button { flex: 0 0 auto; }
+
+.overlay-note { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; }
+
+/* ------------------------------------------------------------ controls -- */
+
+/*
+  Mouse users are not abandoned, but nothing is resident: the controls appear
+  on movement and fade again, the way a video player's do.
+*/
+#controls {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  z-index: 5;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .2s ease;
+}
+
+body.show-chrome #controls { opacity: 1; pointer-events: auto; }
+
+#autoplay-banner {
+  position: absolute;
+  left: 50%; bottom: 58px;
+  transform: translateX(-50%);
+  background: var(--accent);
+  color: #04121f;
+  border: 0; font-weight: 600;
+  border-radius: 999px;
+  padding: 9px 18px;
+  z-index: 9;
+  box-shadow: 0 6px 24px #000a;
+}
+
+/* -------------------------------------------------------------- mobile -- */
+
+@media (max-width: 700px) {
+  #controls { flex-wrap: wrap; justify-content: center; max-width: 96vw; }
+  #chat-float { bottom: 60px; max-width: 80vw; }
+  .bar-hint { display: none; }
+}
+
+@media (hover: none) {
+  /* No hover on touch, so labels stay visible rather than never appearing. */
+  .tile-label, .tile-index { opacity: 1; }
+}

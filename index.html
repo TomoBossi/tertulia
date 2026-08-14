@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0d10">
+<title>tertulia</title>
+<meta name="description" content="A free, serverless video call. No account, no install, nothing recorded.">
+<link rel="stylesheet" href="style.css">
+
+<!--
+  Import maps give bare-name imports with no bundler and no npm. Both
+  libraries are vendored, so nothing outside this repository has to be up.
+
+  While developing the libraries alongside this app, point these at
+  ../plaza/src/plaza.js and ../mirador/src/mirador.js instead — that is the
+  entire difference between local development and shipping.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "plaza": "./vendor/plaza/src/plaza.js",
+    "mirador": "./vendor/mirador/src/mirador.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<!-- ------------------------------------------------------------ landing -->
+<main id="landing">
+  <div class="landing-inner">
+    <h1>tertulia</h1>
+    <p class="tagline">A video call with no server, no account and no install.
+       Type the same code as your friends and you are connected directly to
+       each other.</p>
+
+    <div class="preview-wrap">
+      <video id="preview" autoplay muted playsinline></video>
+      <div id="preview-placeholder">starting camera…</div>
+      <div class="preview-controls">
+        <button id="preview-mic" type="button" class="chip">
+          <span class="on-label">mic</span><span class="off-label">mic off</span>
+        </button>
+        <button id="preview-cam" type="button" class="chip">
+          <span class="on-label">cam</span><span class="off-label">cam off</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="device-row">
+      <select id="camera-select" hidden aria-label="Camera"></select>
+      <select id="mic-select" hidden aria-label="Microphone"></select>
+    </div>
+
+    <form id="join-form">
+      <div class="room-row">
+        <input id="room-input" autocomplete="off" spellcheck="false" placeholder="amber-otter-42" aria-label="Room">
+        <button id="regenerate" type="button" title="new code">↻</button>
+      </div>
+      <input id="nick-input" autocomplete="nickname" maxlength="40" placeholder="your name" aria-label="Your name">
+      <button id="join-button" type="submit" class="primary">join</button>
+      <p id="landing-error" class="error"></p>
+    </form>
+
+    <p class="note">
+      Peer-to-peer. Nothing is stored and nobody can record it centrally,
+      because there is no centre. Four on video is comfortable; audio scales
+      much further.
+      <br><br>
+      Once you are in, everything is on the keyboard. Press <kbd>?</kbd> for the
+      list.
+    </p>
+  </div>
+</main>
+
+<!-- ---------------------------------------------------------------- call -->
+<div id="call" hidden>
+
+  <!-- The video fills the viewport. Everything else floats over it. -->
+  <div id="stage"></div>
+
+  <!-- A dwm-style status line: one row, no padding to speak of, toggle with b -->
+  <div id="bar">
+    <span class="bar-room" id="bar-room"></span>
+    <span class="bar-tags" id="bar-tags"></span>
+    <span class="bar-spacer"></span>
+    <span class="bar-state" id="bar-state"></span>
+    <span class="bar-net" id="bar-net"></span>
+    <span class="bar-hint">? keys</span>
+  </div>
+
+  <!-- Recent chat floats bottom-left over the video and fades on its own -->
+  <div id="chat-float"></div>
+
+  <!-- A prompt line, dmenu-style, rather than a panel that steals space -->
+  <form id="chat-prompt" hidden>
+    <span class="prompt-label">say</span>
+    <input id="chat-input" autocomplete="off" maxlength="2000">
+  </form>
+
+  <!-- Overlays: centred, dismissed with Escape, never resident -->
+  <div id="overlay" hidden>
+    <div id="overlay-card"></div>
+  </div>
+
+  <!-- Mouse users get controls on movement; they fade out again -->
+  <nav id="controls" class="fade">
+    <button data-key="m" type="button" class="chip" title="mute (m)">
+      <span class="on-label">mic</span><span class="off-label">mic off</span>
+    </button>
+    <button data-key="v" type="button" class="chip" title="camera (v)">
+      <span class="on-label">cam</span><span class="off-label">cam off</span>
+    </button>
+    <button data-key="s" type="button" class="chip" title="share screen (s)">share</button>
+    <button data-key="c" type="button" class="chip" title="chat (c)">chat</button>
+    <button data-key="p" type="button" class="chip" title="people (p)">people</button>
+    <button data-key="i" type="button" class="chip" title="invite (i)">invite</button>
+    <button data-key="Q" type="button" class="chip danger" title="leave (shift+q)">leave</button>
+  </nav>
+
+  <button id="autoplay-banner" hidden type="button">click to enable sound</button>
+</div>
+
+<script type="module" src="./app/main.js"></script>
+</body>
+</html>
