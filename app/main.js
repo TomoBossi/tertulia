@@ -13,6 +13,15 @@ let float = null
 let overlayName = null
 let roomCode = ''
 
+/**
+ * The whole transcript for this session.
+ *
+ * Floating lines fade so they do not sit on top of anyone's face, but a
+ * message that scrolled away with nowhere to go back to is just lost. This is
+ * where it goes back to. Still nothing persistent — it dies with the tab.
+ */
+const history = []
+
 // ---------------------------------------------------------------- landing
 
 const roomInput = $('#room-input')
@@ -116,8 +125,8 @@ async function enterCall(code, nick) {
   float.system(`room ${code} · press ? for keys`)
 
   session.on('change', render)
-  session.on('chat', (msg) => float.append(msg))
-  session.on('notice', (text) => float.system(text))
+  session.on('chat', (msg) => { float.append(msg); recordChat(msg) })
+  session.on('notice', (text) => { float.system(text); recordChat({ system: true, text }) })
 
   if (media.stream) {
     room.addStream(media.stream, { kind: 'camera' })
@@ -168,8 +177,6 @@ function render() {
   $('[data-key="m"]').classList.toggle('off', !media.audioEnabled)
   $('[data-key="v"]').classList.toggle('off', !media.videoEnabled)
   $('[data-key="s"]').classList.toggle('active', !!media.screenStream)
-
-  if (overlayName === 'people') showPeople()
 }
 
 // -------------------------------------------------------------- keyboard
@@ -186,8 +193,8 @@ const BINDINGS = {
   m: () => session.toggleAudio(),
   v: () => session.toggleVideo(),
   s: () => session.toggleScreen(),
-  c: () => openPrompt(),
-  p: () => toggleOverlay('people'),
+  Enter: () => openPrompt(),
+  h: () => toggleHistory(),
   i: () => toggleOverlay('invite'),
   b: () => document.body.classList.toggle('bar-hidden'),
   f: () => { session.cycleLayout(); render() },
@@ -256,6 +263,46 @@ $('#chat-prompt').addEventListener('submit', (e) => {
   closePrompt()
 })
 
+// -------------------------------------------------------------- history
+
+function recordChat(entry) {
+  history.push({ ...entry, at: Date.now() })
+  if (history.length > 500) history.shift()
+  if (!$('#history').hidden) renderHistory()
+}
+
+function toggleHistory() {
+  const open = $('#history').hidden
+  $('#history').hidden = !open
+  document.body.classList.toggle('history-open', open)
+  $('[data-key="h"]')?.classList.toggle('active', open)
+
+  if (open) renderHistory()
+  // The stage just changed width; ResizeObserver catches it, but doing it here
+  // avoids a frame of tiles in the wrong place.
+  stage?.layout()
+}
+
+function renderHistory() {
+  const host = $('#history-lines')
+  const atBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 40
+
+  if (history.length === 0) {
+    host.innerHTML = '<div class="hist-empty">nothing said yet</div>'
+    return
+  }
+
+  host.innerHTML = history.map((entry) => entry.system
+    ? `<div class="hist-line system">${escapeHtml(entry.text)}</div>`
+    : `<div class="hist-line${entry.self ? ' self' : ''}">` +
+      `<span class="who">${escapeHtml(entry.nick)}</span> ${escapeHtml(entry.text)}</div>`
+  ).join('')
+
+  // Only follow along if the reader was already at the bottom; yanking someone
+  // away from what they were reading is rude.
+  if (atBottom) host.scrollTop = host.scrollHeight
+}
+
 // -------------------------------------------------------------- overlays
 
 function toggleOverlay(name) {
@@ -264,7 +311,6 @@ function toggleOverlay(name) {
   $('#overlay').hidden = false
 
   if (name === 'help') showHelp()
-  if (name === 'people') showPeople()
   if (name === 'invite') showInvite()
 }
 
@@ -279,15 +325,15 @@ $('#overlay').addEventListener('click', (e) => {
 
 function showHelp() {
   const keys = [
+    ['enter', 'say something'],
+    ['h', 'chat log'],
     ['m', 'mute / unmute'],
     ['v', 'camera on / off'],
     ['s', 'share screen'],
-    ['c', 'chat — enter sends, escape cancels'],
-    ['p', 'who is here'],
     ['i', 'invite link and QR'],
-    ['1–9', 'pin that participant'],
+    ['1-9', 'pin that participant'],
     ['0', 'unpin'],
-    ['f', 'cycle layout: auto, grid, spotlight'],
+    ['f', 'layout: auto / grid / spotlight'],
     ['b', 'show / hide the bar'],
     ['?', 'this list'],
     ['shift+Q', 'leave'],
@@ -295,29 +341,9 @@ function showHelp() {
 
   $('#overlay-card').innerHTML =
     '<h2>keys</h2><div class="keys">' +
-    keys.map(([k, what]) => `<kbd>${k}</kbd><span>${what}</span>`).join('') +
-    '</div><p class="overlay-note">Double-click a tile to pin it. Move the mouse for buttons.</p>'
-}
-
-function showPeople() {
-  const rows = session.participants().map((p, i) => {
-    const marks = []
-    if (p.presence?.audioEnabled === false) marks.push('muted')
-    if (p.presence?.sharingScreen) marks.push('sharing')
-    if (p.net?.relayed) marks.push('relayed')
-    if (p.net?.rtt != null) marks.push(`${p.net.rtt}ms`)
-
-    return `<div class="roster-row${p.id === session.pinned ? ' pinned' : ''}" data-id="${p.id}">
-      <span>${i + 1}. ${escapeHtml(p.nick)}${p.self ? ' (you)' : ''}</span>
-      <span class="roster-marks">${marks.join(' · ')}</span></div>`
-  }).join('')
-
-  $('#overlay-card').innerHTML = `<h2>people</h2>${rows}
-    <p class="overlay-note">Click, or press 1–9 to pin. 0 unpins.</p>`
-
-  for (const row of $('#overlay-card').querySelectorAll('.roster-row')) {
-    row.addEventListener('click', () => { session.pin(row.dataset.id); render() })
-  }
+    keys.map(([k, what]) =>
+      `<span class="k">${k}</span><span class="d">${what}</span>`).join('') +
+    '</div>'
 }
 
 function showInvite() {
@@ -329,9 +355,7 @@ function showInvite() {
     <div class="link-row">
       <input id="invite-url" readonly value="${escapeHtml(link)}">
       <button id="invite-copy" type="button">copy</button>
-    </div>
-    <p class="overlay-note">Anyone with this link can join — there is no other
-    access control, the same as a link to a shared document.</p>`
+    </div>`
 
   $('#invite-copy').addEventListener('click', async () => {
     try {

@@ -40,10 +40,10 @@
       <video id="preview" autoplay muted playsinline></video>
       <div id="preview-placeholder">starting camera…</div>
       <div class="preview-controls">
-        <button id="preview-mic" type="button" class="chip">
+        <button id="preview-mic" type="button" class="chip toggle">
           <span class="on-label">mic</span><span class="off-label">mic off</span>
         </button>
-        <button id="preview-cam" type="button" class="chip">
+        <button id="preview-cam" type="button" class="chip toggle">
           <span class="on-label">cam</span><span class="off-label">cam off</span>
         </button>
       </div>
@@ -94,6 +94,13 @@
   <!-- Recent chat floats bottom-left over the video and fades on its own -->
   <div id="chat-float"></div>
 
+  <!-- The full transcript, when you want it. Toggled with h; the stage
+       shrinks to make room rather than the panel covering anyone. -->
+  <aside id="history" hidden>
+    <div class="history-head">log</div>
+    <div id="history-lines"></div>
+  </aside>
+
   <!-- A prompt line, dmenu-style, rather than a panel that steals space -->
   <form id="chat-prompt" hidden>
     <span class="prompt-label">say</span>
@@ -107,15 +114,15 @@
 
   <!-- Mouse users get controls on movement; they fade out again -->
   <nav id="controls" class="fade">
-    <button data-key="m" type="button" class="chip" title="mute (m)">
+    <button data-key="m" type="button" class="chip toggle" title="mute (m)">
       <span class="on-label">mic</span><span class="off-label">mic off</span>
     </button>
-    <button data-key="v" type="button" class="chip" title="camera (v)">
+    <button data-key="v" type="button" class="chip toggle" title="camera (v)">
       <span class="on-label">cam</span><span class="off-label">cam off</span>
     </button>
     <button data-key="s" type="button" class="chip" title="share screen (s)">share</button>
-    <button data-key="c" type="button" class="chip" title="chat (c)">chat</button>
-    <button data-key="p" type="button" class="chip" title="people (p)">people</button>
+    <button data-key="Enter" type="button" class="chip" title="chat (enter)">chat</button>
+    <button data-key="h" type="button" class="chip" title="history (h)">log</button>
     <button data-key="i" type="button" class="chip" title="invite (i)">invite</button>
     <button data-key="Q" type="button" class="chip danger" title="leave (shift+q)">leave</button>
   </nav>

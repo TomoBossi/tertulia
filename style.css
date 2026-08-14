@@ -129,9 +129,16 @@ kbd {
 .chip.off { background: #f851491f; border-color: #f8514966; color: #ff9b95; }
 .chip.active { background: #4a9eff22; border-color: #4a9eff88; color: var(--accent); }
 .chip.danger { border-color: #f8514955; color: #ff9b95; }
-.chip .off-label { display: none; }
-.chip.off .on-label { display: none; }
-.chip.off .off-label { display: inline; }
+/*
+  A toggle must not resize when its label changes. Both labels occupy the same
+  grid cell, so the button is always as wide as the longer of the two and
+  visibility — not display — does the switching.
+*/
+.chip.toggle { display: inline-grid; place-items: center; }
+.chip.toggle > span { grid-area: 1 / 1; }
+.chip.toggle .off-label { visibility: hidden; }
+.chip.toggle.off .on-label { visibility: hidden; }
+.chip.toggle.off .off-label { visibility: visible; }
 
 /* ---------------------------------------------------------------- call -- */
 
@@ -150,6 +157,11 @@ kbd {
 }
 
 body.bar-hidden #stage { top: 0; }
+body.history-open #stage { left: 264px; }
+#stage { transition: top .15s ease, left .15s ease; }
+
+/* The floating lines would duplicate the transcript sitting beside them. */
+body.history-open #chat-float { display: none; }
 
 .tile {
   position: absolute;
@@ -312,50 +324,101 @@ body.bar-hidden #bar { transform: translateY(-100%); opacity: 0; }
 
 /* ------------------------------------------------------------- overlay -- */
 
+/*
+  Popups follow the bar, not the landing page: near-black, square corners, one
+  monospace face throughout. A rounded translucent card in the middle of a
+  tiling interface looks like it wandered in from another application.
+*/
 #overlay {
   position: absolute; inset: 0;
   display: grid; place-items: center;
-  background: #000000a8;
-  backdrop-filter: blur(3px);
+  background: #000000cc;
   z-index: 8;
   padding: 20px;
 }
 
 #overlay-card {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 18px 20px;
-  max-width: 460px;
+  background: #05070a;
+  border: 1px solid #2c3540;
+  border-radius: 2px;
+  padding: 14px 16px;
+  max-width: 420px;
   width: 100%;
   max-height: 80vh;
   overflow-y: auto;
+  font: 12.5px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-#overlay-card h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase;
-                   letter-spacing: .6px; color: var(--muted); }
-
-.keys { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13.5px; }
-.keys kbd { justify-self: start; }
-
-.roster-row {
-  display: flex; justify-content: space-between; gap: 10px;
-  padding: 6px 8px; border-radius: 6px; font-size: 13.5px; cursor: pointer;
+#overlay-card h2 {
+  margin: 0 0 10px;
+  font: 11px/1 ui-monospace, Menlo, monospace;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--accent);
+  border-bottom: 1px solid #1c232b;
+  padding-bottom: 8px;
 }
 
-.roster-row:hover { background: #1c232b; }
-.roster-row.pinned { background: #4a9eff1a; box-shadow: inset 2px 0 0 var(--accent); }
-.roster-marks { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.keys { display: grid; grid-template-columns: 6.5em 1fr; gap: 2px 10px; }
+.keys .k { color: var(--accent); }
+.keys .d { color: var(--muted); }
 
-#invite-qr { background: #fff; padding: 10px; border-radius: 8px; display: block;
-             width: 190px; margin: 0 auto 12px; line-height: 0; }
-#invite-qr svg { width: 170px; height: 170px; display: block; }
+#invite-qr { background: #fff; padding: 8px; border-radius: 2px; display: block;
+             width: 178px; margin: 0 auto 12px; line-height: 0; }
+#invite-qr svg { width: 162px; height: 162px; display: block; }
 
 .link-row { display: flex; gap: 6px; }
-.link-row input { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
-.link-row button { flex: 0 0 auto; }
+.link-row input {
+  font: 12px/1 ui-monospace, Menlo, monospace;
+  border-radius: 2px; padding: 7px 8px;
+}
+.link-row button {
+  flex: 0 0 auto; border-radius: 2px;
+  font: 12px/1 ui-monospace, Menlo, monospace; padding: 7px 10px;
+}
 
-.overlay-note { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; }
+/* -------------------------------------------------------------- history -- */
+
+/*
+  The transcript is a column, and the stage gives up its width rather than the
+  panel covering anyone — which is what a tiling window manager would do.
+*/
+#history {
+  position: absolute;
+  left: 0; top: var(--bar); bottom: 0;
+  width: 264px;
+  background: #05070a;
+  border-right: 1px solid #1c232b;
+  display: flex;
+  flex-direction: column;
+  z-index: 4;
+  font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+body.bar-hidden #history { top: 0; }
+
+.history-head {
+  font-size: 11px; letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--accent);
+  padding: 6px 10px;
+  border-bottom: 1px solid #1c232b;
+}
+
+#history-lines {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.hist-line { word-wrap: break-word; overflow-wrap: anywhere; }
+.hist-line .who { color: var(--accent); }
+.hist-line.self .who { color: var(--good); }
+.hist-line.system { color: #5b6773; }
+.hist-empty { color: #5b6773; }
 
 /* ------------------------------------------------------------ controls -- */
 

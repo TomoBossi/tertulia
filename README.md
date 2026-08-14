@@ -22,14 +22,16 @@ tertulia borrows from tiling window managers instead:
   <kbd>b</kbd> and it is gone.
 - **No resident controls.** Buttons appear when the mouse moves and fade again.
 - **Chat floats and fades** over the video rather than occupying a panel.
+  <kbd>h</kbd> opens the full log as a column, and the stage yields width to it
+  rather than the panel covering anyone.
 - **Everything is on the keyboard.**
 
 ```
+enter     say something — enter again sends, escape cancels
+h         chat log
 m         mute / unmute
 v         camera on / off
 s         share screen
-c         chat — enter sends, escape cancels
-p         who is here
 i         invite link and QR
 1–9       pin that participant
 0         unpin
@@ -109,17 +111,20 @@ gradual softening, but arithmetic is arithmetic. **Audio scales much further** �
 a dozen people cost about 300 kbps.
 
 **Roughly one pair in eight cannot connect directly.** Usually two mobile
-networks. Instead of a mysterious silence, the tile says `relayed` or `cannot
-connect` and the people list explains why. Fixing it needs a TURN relay, which
-costs real bandwidth and is therefore not included.
+networks. Instead of a mysterious silence, that peer's tile is badged `relayed`
+or `cannot connect`, and the bar carries the worst round trip in the room.
+Fixing it needs a TURN relay, which costs real bandwidth and is therefore not
+included.
 
 **Screen sharing does not work on iOS.** Safari does not implement it. iPhones
 can join and send camera and microphone, but cannot present.
 
-**Nothing is stored.** No recordings, no transcript, no history, no accounts.
-Chat is deliberately transient. Nobody can record it centrally because there is
-no centre — which is a real claim that Zoom cannot make, and the reason not to
-add a server later without thinking hard about it.
+**Nothing is stored.** No recordings, no accounts, nothing written anywhere.
+The chat log kept by <kbd>h</kbd> lives in the tab's memory and dies with it —
+it exists so a message does not vanish mid-session, not so anyone can go back
+to it tomorrow. Nobody can record a call centrally because there is no centre,
+which is a claim Zoom cannot make, and the reason not to add a server later
+without thinking hard about it.
 
 ## Layout
 
