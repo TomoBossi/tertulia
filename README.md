@@ -44,8 +44,10 @@ networks. The tile is badged `relayed` or `cannot connect` rather than going
 quietly silent. Fixing it needs a relay, which costs real bandwidth, so there
 isn't one.
 
-**Screen sharing does not work on iOS.** Safari does not implement it. iPhones
-can join and send camera and microphone, but cannot present.
+**Screen sharing does not work on phones or tablets.** Not on iOS, and not on
+Android either — capturing the screen needs a permission no mobile OS gives a
+web page, so it is not a browser you can switch away from. Phones can join and
+send camera and microphone; they cannot present.
 
 **Nothing is stored.** No recordings, no accounts, nothing written anywhere. The
 chat log lives in the tab and dies with it. Nobody can record a call centrally

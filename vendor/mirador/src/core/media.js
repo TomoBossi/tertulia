@@ -149,13 +149,19 @@ export class LocalMedia extends Emitter {
   /**
    * Start sharing the screen.
    *
-   * `getDisplayMedia` is not implemented in Safari on iOS, so this throws
-   * there rather than failing obscurely. Check `LocalMedia.canShareScreen`
-   * before offering the button.
+   * `getDisplayMedia` is absent on phones and tablets generally, not on one
+   * vendor's browser — capturing the screen needs a privileged platform API
+   * that no mobile OS exposes to the web, so switching browsers does not help.
+   * This throws rather than failing obscurely; check
+   * `LocalMedia.canShareScreen` before offering the button.
    */
   async startScreen({ audio = true } = {}) {
     if (!LocalMedia.canShareScreen) {
-      const err = new Error('This browser cannot share a screen. On iOS, Safari does not implement it.')
+      // Says what was detected — the API is missing — and stops. Naming a
+      // platform the code never checked for is worse than saying nothing: it
+      // tells someone on Android the message was not written for them, so
+      // they cannot tell whether any of it applies.
+      const err = new Error('This browser does not offer screen sharing.')
       this.emit('error', err)
       throw err
     }

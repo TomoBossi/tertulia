@@ -121,6 +121,12 @@ async function enterCall(code, nick) {
   stage = new Stage($('#stage'))
   stage.onPin = (id) => { session.pin(id); render() }
 
+  // No mobile OS lets a web page capture the screen, so on a phone this
+  // button is an invitation to fail. Taking it out also gives the six that do
+  // work a seventh more width each, which on a narrow screen is the
+  // difference between labels and ellipses.
+  if (!LocalMedia.canShareScreen) $('[data-key="s"]').hidden = true
+
   float = new FloatChat($('#chat-float'))
   // A phone has no key to press, so the hint is only advice on how to fail.
   float.system(TOUCH ? `room ${code}` : `room ${code} · press ? for keys`)
@@ -334,7 +340,7 @@ function showHelp() {
     ['h', 'chat log'],
     ['m', 'mute / unmute'],
     ['v', 'camera on / off'],
-    ['s', 'share screen'],
+    ...(LocalMedia.canShareScreen ? [['s', 'share screen']] : []),
     ['i', 'invite link and QR'],
     ['1-9', 'pin that participant'],
     ['0', 'unpin'],
