@@ -12,6 +12,26 @@
  */
 
 /**
+ * The connection's state, read from the field that tells the truth.
+ *
+ * `iceConnectionState` is the legacy aggregate and it lies after exactly the
+ * renegotiations this stack performs on every call — adding media right after
+ * the data channel opens. Chrome can leave it on `checking` indefinitely for
+ * a connection that is verifiably carrying traffic, and both field logs of a
+ * call "stuck connecting" show that signature: the peer completed its
+ * handshake over an open data channel half a second before the state claimed
+ * it was still trying. `connectionState` aggregates ICE and DTLS per the
+ * modern spec and does not have the bug, so it wins whenever it has an
+ * opinion; the legacy state is only a fallback for `new`, where the modern
+ * field has nothing to say yet.
+ */
+export function connectionStateOf(pc) {
+  const modern = pc.connectionState
+  if (modern && modern !== 'new') return modern
+  return pc.iceConnectionState ?? modern ?? 'new'
+}
+
+/**
  * Summarise a peer connection.
  *
  * Note which direction each number describes. `packetLoss` is what *we* failed
@@ -31,7 +51,7 @@
  */
 export async function watchConnection(pc) {
   const summary = {
-    state: pc.iceConnectionState,
+    state: connectionStateOf(pc),
     path: null,
     relayed: false,
     rtt: null,
@@ -203,6 +223,7 @@ export function describeConnection(net) {
     case 'closed':
       return { label: 'closed', tone: 'muted', detail: '' }
     case 'checking':
+    case 'connecting':
     case 'new':
       return { label: 'connecting', tone: 'muted', detail: 'Trying to find a path through both networks.' }
   }

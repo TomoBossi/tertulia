@@ -130,8 +130,14 @@ function modeLine() {
   const relay = opts.rtcConfig
     ? opts.rtcConfig.iceServers.find((s) => String(s.urls).includes('turn'))
     : null
-  return `settings: recovery ${opts.recover === false ? 'OFF' : opts.recover || 'on'}`
+  // document.lastModified is the served page's mtime, which on this host
+  // changes exactly once per deploy. It is in the log because one field test
+  // demonstrably ran a stale cached build while a newer one was live, and
+  // nothing in the log said so — every conclusion drawn from it was about the
+  // wrong code. A log that does not say what produced it is a trap.
+  return `settings: recovery ${opts.recover === false ? 'OFF' : 'on'}`
     + `, relay ${relay ? String(relay.urls) : 'none'}`
+    + `, page built ${document.lastModified}`
 }
 
 function connectionOptions() {
@@ -144,9 +150,7 @@ function connectionOptions() {
   const setting = (key) => localStorage.getItem(`tertulia:${key}`) || ''
 
   const options = {}
-  const ice = setting('ice')
-  if (ice === 'off') options.recover = false
-  if (ice === 'aggressive') options.recover = 'aggressive'
+  if (setting('ice') === 'off') options.recover = false
 
   const turn = setting('turn')
   if (turn) {

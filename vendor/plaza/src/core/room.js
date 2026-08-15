@@ -9,20 +9,6 @@ import { watchConnection } from './diagnostics.js'
  * candidate pair over 4G can genuinely take several seconds to nominate — and
  * short enough that a person has not yet given up and reloaded.
  */
-const STALL_MS = 12000
-
-/** How many times to regather before forfeiting the attempt entirely. */
-const STALL_RETRIES = 1
-
-/**
- * How many whole handshakes to throw away before saying so out loud.
- *
- * Each is an independent try, so a few are worth taking — but a pair of
- * networks that has failed this many times is not unlucky, it is incompatible,
- * and repeating forever would hide that behind a spinner.
- */
-const MAX_REBUILDS = 4
-
 /**
  * A room: the people in it, what they are broadcasting about themselves, and
  * the channels anything else can talk over.
@@ -79,7 +65,6 @@ export class Room extends Emitter {
   #bitrate = null
   #playout = null
   #bitrateJob = Promise.resolve()
-  #rebuilds = new Map()
 
   /**
    * Whether to intervene in a handshake that is going badly.
@@ -732,118 +717,67 @@ export class Room extends Emitter {
   }
 
   /**
-   * Try to rebuild a path that has gone quiet, before it is too late.
+   * Watch one peer connection, keyed to the connection object itself.
    *
-   * A disconnected connection is closed for good five seconds later, and
-   * neither peer gets it back — the one that was starved never even learns it
-   * happened, because it is still playing out video that already arrived.
-   * Restarting ICE gathers fresh candidates and renegotiates, which is the
-   * one recovery available, and it only works inside that window.
+   * The transport replaces this object whenever it rebuilds, and state kept
+   * under the peer's name outlives the connection it described — so each
+   * connection carries its own watcher and its own flags.
    *
-   * Once per episode: a restart storm would make a struggling link worse.
-   */
-  /**
-   * Watch one peer connection's ICE state directly.
-   *
-   * This used to be driven off the two-second stats poll, which is far too
-   * slow to matter. The transport underneath destroys a peer five seconds
-   * after it goes `disconnected`, and a restart on a mobile network needs most
-   * of that: regather a reflexive candidate through STUN, carry an offer and
-   * answer through the rendezvous, punch again. Spending the first one or two
-   * of those five seconds waiting for a poll tick is the difference between a
-   * recovery that lands and one that never gets the chance.
+   * Everything here keys off `connectionState`, never `iceConnectionState`.
+   * The legacy ICE state lies after the renegotiations this stack performs
+   * routinely (adding media right after the data channel opens): Chrome can
+   * report `checking` indefinitely on a connection that is verifiably up —
+   * the data channel is open and the application handshake completed over it.
+   * Both field logs of "stuck connecting" show exactly that signature, and a
+   * recovery keyed to the lying state restarted healthy calls, which is where
+   * the join/leave churn came from.
    */
   #watchIce(peerId, pc) {
     if (this.#watched.has(pc)) return
-    // Per connection, not per peer. The transport replaces this object
-    // whenever it rebuilds, and state kept under the peer's name outlives the
-    // connection it described: timers then fire against an object that is
-    // already dead, while the live one is refused a watcher because its peer
-    // "already has" one. The machinery goes inert and hostile at once.
-    this.#watched.set(pc, { restarted: false, stall: null })
+    this.#watched.set(pc, { restarted: false })
 
     try {
-      const onChange = () => this.#onIceState(peerId, pc)
-      pc.addEventListener('iceconnectionstatechange', onChange)
+      const onChange = () => this.#onConnectionState(peerId, pc)
+      pc.addEventListener('connectionstatechange', onChange)
       onChange()
     } catch (err) {
       this.#note(peerId, 'ice-watch-failed', err?.message ?? String(err))
     }
   }
 
-  #onIceState(peerId, pc) {
+  #onConnectionState(peerId, pc) {
     if (this.#left || !this.#recover) return
     const own = this.#watched.get(pc)
     if (!own) return
 
-    const state = pc.iceConnectionState
+    const state = pc.connectionState
 
-    if (state === 'connected' || state === 'completed') {
+    if (state === 'connected') {
       own.restarted = false
-      clearTimeout(own.stall)
-      own.stall = null
-      this.#rebuilds.delete(peerId)
       return
     }
 
-    if (state === 'disconnected' || state === 'failed') {
-      clearTimeout(own.stall)
-      own.stall = null
-      if (own.restarted) return
-      own.restarted = true
+    // Only `disconnected` is acted on, and only with a restart-in-place.
+    //
+    // This is the one intervention the transport's signaling can actually
+    // carry: after a connection is up, every renegotiation — this restart
+    // offer included — travels over the connection's own data channel. A path
+    // that has genuinely died therefore cannot be rescued from here at all;
+    // the offer sinks with the ship, and the transport's five-second teardown
+    // and rebuild-from-scratch is the real recovery. What a restart does fix
+    // is the half-broken path: consent checks failing while the channel still
+    // delivers, which is exactly the case the wifi logs show it recovering.
+    if (state !== 'disconnected') return
+    if (own.restarted) return
+    own.restarted = true
 
-      // Only one side offers, or the two collide mid-renegotiation.
-      const delay = this.selfId < peerId ? 0 : 1200
-      setTimeout(() => {
-        if (this.#left) return
-        const now = pc.iceConnectionState
-        if (now === 'connected' || now === 'completed' || now === 'closed') return
-        this.#restartIce(peerId, pc, 'path went quiet; regathering')
-      }, delay)
-      return
-    }
-
-    // A handshake still in progress. Nothing here is done by default: a
-    // regather abandons checks that may have been about to succeed, and there
-    // is no evidence it helps. Opt in with `aggressive` if a network turns out
-    // to need it.
-    if (this.#recover !== 'aggressive') return
-    if (own.stall) return
-    this.#armStall(peerId, pc, own)
-  }
-
-  #armStall(peerId, pc, own) {
-    const attempt = (n) => {
-      own.stall = setTimeout(() => {
-        own.stall = null
-        if (this.#left) return
-        const state = pc.iceConnectionState
-        if (state !== 'checking' && state !== 'new') return
-
-        if (n <= STALL_RETRIES) {
-          this.#restartIce(peerId, pc, `still ${state} after ${STALL_MS * n / 1000}s; regathering`)
-          attempt(n + 1)
-          return
-        }
-
-        const count = (this.#rebuilds.get(peerId) ?? 0) + 1
-        this.#rebuilds.set(peerId, count)
-
-        if (count > MAX_REBUILDS) {
-          this.#note(peerId, 'gave-up',
-            `${count - 1} handshakes failed; this pair of networks may need a relay`)
-          return
-        }
-
-        this.#note(peerId, 'rebuild', `handshake never completed; attempt ${count}`)
-        try {
-          pc.close()
-        } catch (err) {
-          this.#note(peerId, 'rebuild-failed', err?.message ?? String(err))
-        }
-      }, STALL_MS)
-    }
-    attempt(1)
+    // Only one side offers, or the two collide mid-renegotiation.
+    const delay = this.selfId < peerId ? 0 : 1200
+    setTimeout(() => {
+      if (this.#left) return
+      if (pc.connectionState !== 'disconnected') return
+      this.#restartIce(peerId, pc, 'path went quiet; regathering')
+    }, delay)
   }
 
   #restartIce(peerId, pc, why) {
