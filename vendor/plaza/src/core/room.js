@@ -11,6 +11,18 @@ import { watchConnection } from './diagnostics.js'
  */
 const STALL_MS = 12000
 
+/** How many times to regather before forfeiting the attempt entirely. */
+const STALL_RETRIES = 1
+
+/**
+ * How many whole handshakes to throw away before saying so out loud.
+ *
+ * Each is an independent try, so a few are worth taking — but a pair of
+ * networks that has failed this many times is not unlucky, it is incompatible,
+ * and repeating forever would hide that behind a spinner.
+ */
+const MAX_REBUILDS = 4
+
 /**
  * A room: the people in it, what they are broadcasting about themselves, and
  * the channels anything else can talk over.
@@ -69,6 +81,7 @@ export class Room extends Emitter {
   #bitrateJob = Promise.resolve()
   #restarts = new Map()
   #stalls = new Map()
+  #rebuilds = new Map()
   #watched = new WeakSet()
   #strained = new Set()
 
@@ -754,6 +767,10 @@ export class Room extends Emitter {
     if (state === 'connected' || state === 'completed') {
       this.#restarts.delete(peerId)
       this.#clearStall(peerId)
+      // A call that connects has spent none of its budget. Carrying a count
+      // forward would leave a long conversation that hiccups an hour in with
+      // no attempts left for a problem it never had.
+      this.#rebuilds.delete(peerId)
       return
     }
 
@@ -794,13 +811,43 @@ export class Room extends Emitter {
         if (this.#left) return
         const state = pc.iceConnectionState
         if (state !== 'checking' && state !== 'new') return
-        this.#restartIce(peerId, pc, `still ${state} after ${STALL_MS * n / 1000}s; regathering`)
+        if (n <= STALL_RETRIES) {
+          this.#restartIce(peerId, pc, `still ${state} after ${STALL_MS * n / 1000}s; regathering`)
+          attempt(n + 1)
+          return
+        }
 
-        // Once. A regather abandons checks that may have been seconds from
-        // succeeding, and a handshake that has now failed twice is not going
-        // to be talked round by a third attempt — it is telling us the two
-        // networks cannot be joined directly at all.
-        if (n < 2) attempt(n + 1)
+        // Regathering has not worked, so stop reusing this attempt and throw
+        // it away instead.
+        //
+        // A failed hole punch is not a verdict, it is a coin toss that came up
+        // wrong: when one side is behind a router that assigns a port per
+        // destination, success depends on a check arriving while a binding
+        // happens to be open, and the next attempt is an independent try. The
+        // transport already knows this and rebuilds a peer the moment its
+        // connection dies — that is the join/leave churn the far end reports
+        // while this side is stuck.
+        //
+        // Which is exactly the problem. `checking` is not death, so this side
+        // never rebuilt, and the far end spent its retries throwing fresh
+        // attempts at a peer frozen on a stale one. They were never trying at
+        // the same time. Closing forfeits the attempt so both sides start over
+        // together.
+        this.#rebuilds.set(peerId, (this.#rebuilds.get(peerId) ?? 0) + 1)
+        const count = this.#rebuilds.get(peerId)
+
+        if (count > MAX_REBUILDS) {
+          this.#note(peerId, 'gave-up',
+            `${count - 1} handshakes failed; this pair of networks needs a relay`)
+          return
+        }
+
+        this.#note(peerId, 'rebuild', `handshake never completed; attempt ${count}`)
+        try {
+          pc.close()
+        } catch (err) {
+          this.#note(peerId, 'rebuild-failed', err?.message ?? String(err))
+        }
       }, STALL_MS)
       this.#stalls.set(peerId, timer)
     }
