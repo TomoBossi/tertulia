@@ -135,8 +135,7 @@ function modeLine() {
   // demonstrably ran a stale cached build while a newer one was live, and
   // nothing in the log said so — every conclusion drawn from it was about the
   // wrong code. A log that does not say what produced it is a trap.
-  return `settings: signalling ${opts.transport ?? 'trystero'}`
-    + `/${opts.discovery ?? 'relay'}`
+  return `settings: discovery ${opts.discovery ?? 'relay'}`
     + `, recovery ${opts.recover === false ? 'OFF' : 'on'}`
     + `, relay ${relay ? String(relay.urls) : 'none'}`
     + `, page built ${document.lastModified}`
@@ -153,10 +152,6 @@ function connectionOptions() {
 
   const options = {}
   if (setting('ice') === 'off') options.recover = false
-
-  // ?signal=own runs plaza's own signalling instead of the vendored transport.
-  // Identical application code either way — that is the point.
-  if (setting('signal') === 'own') options.transport = 'own'
 
   // ?discovery=tracker finds peers through BitTorrent trackers instead of
   // relays. A tracker introduces peers itself rather than carrying messages

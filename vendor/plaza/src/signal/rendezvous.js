@@ -9,46 +9,15 @@
  * duplicates be deduplicated at the other end, which costs a few hundred bytes
  * and removes an entire class of "the one relay we picked was slow".
  *
- * Event signing is borrowed from the vendored transport rather than
- * reimplemented. Nostr events are BIP-340 Schnorr signed, and hand-rolling
- * that would be replacing a working, audited primitive with a novel one for no
- * reason — the bugs this module exists to avoid are in connection lifecycle,
- * not in cryptography.
+ * Event construction and signing live in ./nostr.js. Only the signature
+ * primitive itself is borrowed — BIP-340 Schnorr, which browsers do not
+ * provide — because reimplementing cryptography to avoid a dependency is a
+ * bad trade at any size.
  */
-import { createEvent } from '../../vendor/trystero.mjs'
+import { createEvent, subscriptionFor } from './nostr.js'
 
 const RECONNECT_MS = 3000
 const MAX_BACKOFF_MS = 30000
-
-/**
- * How far back a subscription asks for, in seconds.
- *
- * A relay filters on `since`, taken from *our* clock, against `created_at`,
- * taken from the *publisher's*. Two devices never agree on the time to the
- * second, and a phone and a desktop routinely differ by several — so asking
- * for "everything from now on" makes every peer whose clock runs slower than
- * ours permanently invisible. Every announcement, offer and candidate it
- * publishes is dropped by the relay before it reaches us, in one direction
- * only, for the whole session. Measured: a publisher five seconds behind is
- * silently discarded.
- *
- * Ten minutes of slack costs nothing to ask for. These are ephemeral events,
- * which relays do not store, so there is no backlog to receive — the window
- * only ever excludes, and excluding is the failure.
- */
-const CLOCK_SLACK_SECONDS = 600
-
-const nowSeconds = () => Math.floor(Date.now() / 1000)
-
-/** Nostr keys ephemeral events by a number derived from the topic. */
-const kindFor = (topic) =>
-  ([...topic].reduce((sum, c) => sum + c.charCodeAt(0), 0) % 10_000) + 20_000
-
-const buildSubscription = (subId, topic) => JSON.stringify([
-  'REQ',
-  subId,
-  { kinds: [kindFor(topic)], since: nowSeconds() - CLOCK_SLACK_SECONDS, '#x': [topic] },
-])
 
 /** Hex SHA-1 of a string, matching the topic derivation relays are keyed on. */
 export async function topicOf(text) {
@@ -95,7 +64,7 @@ export class Rendezvous {
       this.#log('relay-open', url)
       // Re-subscribe on every open, including reconnects: a relay that
       // dropped remembers nothing about us.
-      for (const topic of this.#topics.keys()) this.#send(ws, buildSubscription(subIdFor(topic), topic))
+      for (const topic of this.#topics.keys()) this.#send(ws, subscriptionFor(subIdFor(topic), topic))
     }
 
     ws.onclose = () => {
@@ -145,7 +114,7 @@ export class Rendezvous {
   /** Listen on a topic. Applied to every relay, now and on reconnect. */
   listen(topic, handler) {
     this.#topics.set(topic, handler)
-    const request = buildSubscription(subIdFor(topic), topic)
+    const request = subscriptionFor(subIdFor(topic), topic)
     for (const ws of this.#sockets.values()) this.#send(ws, request)
   }
 

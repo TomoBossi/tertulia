@@ -70,7 +70,7 @@ export {
   qrPath,
 } from './core/invite.js'
 
-export { selfId } from '../vendor/trystero.mjs'
+export { selfId } from './signal/mesh.js'
 
 /** Library version. Bump on release; git tags are what consumers pin to. */
 export const VERSION = '0.1.0'

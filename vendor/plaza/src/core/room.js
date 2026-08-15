@@ -1,5 +1,4 @@
-import { joinRoom as trysteroJoin, selfId as trysteroSelfId } from '../../vendor/trystero.mjs'
-import { joinRoom as ownJoin, selfId as ownSelfId } from '../signal/mesh.js'
+import { joinRoom, selfId as defaultSelfId } from '../signal/mesh.js'
 import { Emitter } from './emitter.js'
 import { watchConnection } from './diagnostics.js'
 
@@ -34,10 +33,7 @@ import { watchConnection } from './diagnostics.js'
  */
 export class Room extends Emitter {
   /** Our own peer id. Stable for the lifetime of the page. */
-  selfId = trysteroSelfId
-
-  /** Which signalling implementation is carrying this room. */
-  transport = 'trystero'
+  selfId = defaultSelfId
 
   /**
    * The transport's own log, when it keeps one.
@@ -104,13 +100,12 @@ export class Room extends Emitter {
   #watched = new WeakMap()
   #strained = new Set()
 
-  constructor(trysteroRoom, { presence = {}, recover = true, transport = 'trystero' } = {}) {
+  constructor(signalRoom, { presence = {}, recover = true } = {}) {
     super()
-    this.#room = trysteroRoom
+    this.#room = signalRoom
     this.presence = { ...presence }
     this.#recover = recover
-    this.transport = transport
-    if (transport === 'own') this.selfId = trysteroRoom.selfId ?? ownSelfId
+    this.selfId = signalRoom.selfId ?? defaultSelfId
 
     this.#wirePresence()
     this.#wireStreams()
@@ -137,8 +132,7 @@ export class Room extends Emitter {
    * the IP address of everyone in the room.
    */
   static async join({
-    room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true,
-    transport = 'trystero', discovery,
+    room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true, discovery,
   } = {}) {
     if (!room || !String(room).trim()) {
       throw new Error('plaza: a room name is required')
@@ -149,10 +143,6 @@ export class Room extends Emitter {
     // everyone reach into the bag for it.
     const initial = { ...(nick ? { nick: String(nick).slice(0, 60) } : {}), ...(presence ?? {}) }
 
-    // Two transports, one surface. The alternative exists to make "is this
-    // the transport or is it us" answerable by flipping a switch rather than
-    // by argument: identical application code, identical diagnostics, one
-    // variable. See src/signal/.
     const config = {
       appId,
       ...(password ? { password } : {}),
@@ -161,11 +151,11 @@ export class Room extends Emitter {
     }
     const name = String(room).trim()
 
-    const tr = transport === 'own' ? ownJoin(config, name) : trysteroJoin(config, name)
-    const roomInstance = new Room(tr, { presence: initial, recover, transport })
+    const tr = joinRoom(config, name)
+    const roomInstance = new Room(tr, { presence: initial, recover })
 
-    // The alternative resolves its keys and topics asynchronously; waiting
-    // means a caller that joins and immediately sends is not racing setup.
+    // Keys and topics resolve asynchronously; waiting means a caller that
+    // joins and immediately sends is not racing setup.
     if (tr.ready) await tr.ready
 
     return roomInstance
@@ -327,7 +317,7 @@ export class Room extends Emitter {
       console[level] = (...args) => {
         original(...args)
         const text = args.map((a) => a?.message ?? String(a)).join(' ')
-        if (!/trystero/i.test(text)) return
+        if (!/plaza|webrtc|rtcpeer/i.test(text)) return
         for (const room of Room.__live) {
           room.#note('-', `transport-${level}`, text.slice(0, 200))
         }
