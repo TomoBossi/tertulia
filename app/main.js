@@ -136,6 +136,7 @@ function modeLine() {
   // nothing in the log said so — every conclusion drawn from it was about the
   // wrong code. A log that does not say what produced it is a trap.
   return `settings: signalling ${opts.transport ?? 'trystero'}`
+    + `/${opts.discovery ?? 'relay'}`
     + `, recovery ${opts.recover === false ? 'OFF' : 'on'}`
     + `, relay ${relay ? String(relay.urls) : 'none'}`
     + `, page built ${document.lastModified}`
@@ -144,7 +145,7 @@ function modeLine() {
 function connectionOptions() {
   const params = new URLSearchParams(location.search)
 
-  for (const key of ['turn', 'turnUser', 'turnPass', 'ice', 'signal']) {
+  for (const key of ['turn', 'turnUser', 'turnPass', 'ice', 'signal', 'discovery']) {
     const value = params.get(key)
     if (value !== null) localStorage.setItem(`tertulia:${key}`, value)
   }
@@ -156,6 +157,12 @@ function connectionOptions() {
   // ?signal=own runs plaza's own signalling instead of the vendored transport.
   // Identical application code either way — that is the point.
   if (setting('signal') === 'own') options.transport = 'own'
+
+  // ?discovery=tracker finds peers through BitTorrent trackers instead of
+  // relays. A tracker introduces peers itself rather than carrying messages
+  // we build matchmaking on top of, and it cannot trickle candidates — so an
+  // offer carries every address it will ever have.
+  if (setting('discovery') === 'tracker') options.discovery = 'tracker'
 
   const turn = setting('turn')
   if (turn) {

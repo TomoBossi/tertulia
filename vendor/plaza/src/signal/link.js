@@ -27,6 +27,16 @@
 /** Role, decided by comparing ids, so both sides always agree without asking. */
 export const isPolite = (selfId, peerId) => selfId > peerId
 
+/**
+ * How long to wait for candidate gathering when candidates cannot be trickled.
+ *
+ * A tracker carries one offer and one answer and nothing else, so everything a
+ * connection will ever know about itself has to be in them. Gathering usually
+ * finishes in well under a second; this is the ceiling before giving up and
+ * sending what we have, which is often enough on its own.
+ */
+const GATHER_TIMEOUT_MS = 4000
+
 export class Link {
   /** @type {RTCPeerConnection} */ pc
   /** @type {RTCDataChannel|null} */ channel = null
@@ -54,9 +64,22 @@ export class Link {
    * @param {(event: string, ...args: any[]) => void} options.emit
    * @param {(what: string, detail?: string) => void} options.log
    */
-  constructor({ selfId, peerId, rtcConfig, send, emit, log }) {
+  /**
+   * @param {object} options
+   * @param {string} options.selfId
+   * @param {string} [options.peerId]   unknown up front in tracker mode
+   * @param {'offer'|'answer'} [options.role]  set explicitly when there is no
+   *   peer id to compare against, which is the case for a speculative offer
+   * @param {boolean} [options.trickle] false when candidates cannot be sent
+   *   separately from the description that carries them
+   */
+  constructor({ selfId, peerId, rtcConfig, send, emit, log, role, trickle = true }) {
     this.peerId = peerId
-    this.polite = isPolite(selfId, peerId)
+    this.trickle = trickle
+    // With a tracker there is no id to compare — whoever's offer the tracker
+    // handed out is the offerer, and there is exactly one offer per
+    // connection, so a collision cannot arise in the first place.
+    this.polite = role ? role === 'answer' : isPolite(selfId, peerId)
     this.#send = send
     this.#emit = emit
     this.#log = log
@@ -64,9 +87,9 @@ export class Link {
     this.pc = new RTCPeerConnection(rtcConfig)
     this.#wire()
 
-    // The impolite side owns the channel, which is also what starts
-    // negotiation: creating it fires negotiationneeded. The polite side waits
-    // for the offer. One opener means no duplicate connection can exist.
+    // The offering side owns the channel, which is also what starts
+    // negotiation: creating it fires negotiationneeded. The answering side
+    // waits. One opener means no duplicate connection can exist.
     if (!this.polite) {
       this.#adopt(this.pc.createDataChannel('plaza', { ordered: true }))
     } else {
@@ -74,10 +97,70 @@ export class Link {
     }
   }
 
+  /**
+   * Wait until this connection knows every address it is going to offer.
+   *
+   * Resolves early when gathering completes, which is the normal case, and on
+   * a deadline otherwise: a partial candidate set still connects far more
+   * often than no offer at all.
+   */
+  #gathered() {
+    if (this.pc.iceGatheringState === 'complete') return Promise.resolve()
+    return new Promise((resolve) => {
+      const done = () => {
+        this.pc.removeEventListener('icegatheringstatechange', check)
+        clearTimeout(timer)
+        resolve()
+      }
+      const check = () => { if (this.pc.iceGatheringState === 'complete') done() }
+      const timer = setTimeout(() => {
+        this.#log('gather-timeout', `sending ${this.pc.localDescription ? 'partial' : 'no'} candidates`)
+        done()
+      }, GATHER_TIMEOUT_MS)
+      this.pc.addEventListener('icegatheringstatechange', check)
+      check()
+    })
+  }
+
+  /** A complete offer, candidates included. For rendezvous without trickle. */
+  async completeOffer() {
+    await this.pc.setLocalDescription(await this.pc.createOffer())
+    await this.#gathered()
+    return this.pc.localDescription?.sdp ?? null
+  }
+
+  /** A complete answer to a complete offer. */
+  async completeAnswer(offerSdp) {
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: offerSdp })
+    await this.pc.setLocalDescription(await this.pc.createAnswer())
+    await this.#gathered()
+    return this.pc.localDescription?.sdp ?? null
+  }
+
+  /** Apply the answer to an offer we published speculatively. */
+  async applyAnswer(sdp) {
+    try {
+      await this.pc.setRemoteDescription({ type: 'answer', sdp })
+      return true
+    } catch (err) {
+      this.#log('answer-rejected', err?.message ?? String(err))
+      return false
+    }
+  }
+
+  /** Name the peer once the rendezvous has said who answered. */
+  identify(peerId) {
+    this.peerId = peerId
+  }
+
   #wire() {
     const pc = this.pc
 
     pc.onnegotiationneeded = async () => {
+      // Without trickle the description is carried once, by the rendezvous, and
+      // there is no path for a later one. Media added after the fact simply
+      // is not renegotiated rather than producing an offer nobody receives.
+      if (!this.trickle) return
       try {
         this.#makingOffer = true
         await pc.setLocalDescription()
@@ -90,7 +173,7 @@ export class Link {
     }
 
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate) this.#send({ type: 'candidate', candidate: candidate.toJSON() })
+      if (candidate && this.trickle) this.#send({ type: 'candidate', candidate: candidate.toJSON() })
     }
 
     pc.onconnectionstatechange = () => {
@@ -124,6 +207,16 @@ export class Link {
 
     channel.onopen = () => {
       this.open = true
+
+      // From here the channel carries its own negotiation. That matters most
+      // for a rendezvous that could not trickle: a speculative offer is made
+      // before anyone knows who it is for and therefore carries no media, so
+      // without this the camera could never be negotiated at all.
+      if (!this.trickle) {
+        this.trickle = true
+        this.#log('trickle-enabled', 'renegotiation now rides the data channel')
+      }
+
       this.#log('channel-open')
       const queued = this.#queuedOut.splice(0)
       for (const data of queued) this.send(data)
@@ -233,8 +326,29 @@ export class Link {
     }
   }
 
+  /**
+   * Publish our current offer again.
+   *
+   * For the case where the peer is still waiting on us: the offer was made,
+   * but the message carrying it did not arrive. Re-sending the description we
+   * already hold is the whole fix — renegotiating would create a second offer
+   * and a collision to resolve, for a problem that is only a lost message.
+   */
+  resendOffer() {
+    if (this.dead) return false
+    const description = this.pc.localDescription
+    if (description?.type !== 'offer') return false
+    this.#send({ type: 'description', description })
+    return true
+  }
+
   addStream(stream) {
+    // Idempotent: the room adds streams to every link, and a link adds
+    // whatever is already published when it opens. Both are right, and one of
+    // them is always second.
+    const existing = new Set(this.pc.getSenders().map((s) => s.track).filter(Boolean))
     for (const track of stream.getTracks()) {
+      if (existing.has(track)) continue
       try { this.pc.addTrack(track, stream) } catch (err) { this.#log('addtrack-failed', err?.message) }
     }
   }

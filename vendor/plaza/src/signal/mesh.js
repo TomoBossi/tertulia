@@ -24,6 +24,7 @@
  * opens the connection.
  */
 import { Rendezvous, topicOf } from './rendezvous.js'
+import { TrackerSwarm, infoHashFor, DEFAULT_TRACKERS } from './tracker.js'
 import { roomKey, seal, open } from './secret.js'
 import { Link } from './link.js'
 
@@ -31,7 +32,43 @@ const ANNOUNCE_MS = 4000
 const ANNOUNCE_WARMUP_MS = [200, 600, 1500]
 const PING_TIMEOUT_MS = 5000
 
-/** A room-scoped random identity, matching the vendored transport's shape. */
+/**
+ * How hard to chase a peer we know exists but have not connected to.
+ *
+ * Announcing on a fixed cadence and hoping is what both implementations did,
+ * and it has a deadlock in it: discovery is not symmetric. If our announce
+ * reaches them but theirs never reaches us — a dropped relay message, a
+ * subscription that missed the window, a relay that went away mid-round —
+ * then the side that should open the connection never learns there is anyone
+ * to open it to, and the side that knows waits forever. Neither is retrying,
+ * because neither believes anything is wrong.
+ *
+ * So a link that has not opened is chased directly, on a widening interval,
+ * and rebuilt from scratch if chasing does not work. The escalation matters
+ * as much as the retry: re-sending the same announce over the same relay that
+ * already lost it is not a strategy.
+ */
+const CHASE_MS = [1000, 2000, 4000, 6000, 8000]
+const REBUILD_AFTER_CHASES = 5
+
+/**
+ * This page's identity, one per load, matching the vendored transport's shape.
+ *
+ * Deliberately global: a page is one peer, and two rooms open at once are the
+ * same person in both. It can be overridden per room, which exists so tests
+ * can put two peers in one process — without that, two rooms in one process
+ * share an id and each dismisses the other's messages as its own echo.
+ */
+/**
+ * An opaque id labelling an offer before its recipient exists.
+ *
+ * Twenty characters, because that is what the tracker protocol wants — the
+ * same width as a peer id. A shorter one is refused with "Invalid request",
+ * which names nothing and is indistinguishable from every other rejection.
+ */
+const randomId = () => [...crypto.getRandomValues(new Uint8Array(20))]
+  .map((b) => (b % 36).toString(36)).join('')
+
 export const selfId = [...crypto.getRandomValues(new Uint8Array(10))]
   .map((b) => b.toString(36).padStart(2, '0'))
   .join('')
@@ -45,9 +82,18 @@ export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
 ]
 
-export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId) {
+export function joinRoom(
+  {
+    appId, password, rtcConfig, relayUrls, makeRendezvous, selfId: idOverride,
+    chaseSchedule = CHASE_MS, rebuildAfter = REBUILD_AFTER_CHASES,
+    discovery = 'relay', trackerUrls,
+  } = {},
+  roomId,
+) {
   if (!appId) throw new Error('plaza/signal: appId is required')
   if (!roomId) throw new Error('plaza/signal: roomId is required')
+
+  const id = idOverride ?? selfId
 
   const listeners = { onPeerJoin: null, onPeerLeave: null, onPeerStream: null }
   const links = new Map()      // peerId -> Link
@@ -72,11 +118,83 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
 
   // ------------------------------------------------------------- signalling
 
+  /**
+   * Get a signal to a peer by the best path available.
+   *
+   * An open data channel beats any rendezvous: it is direct, ordered, and
+   * needs no third party. The rendezvous is only for reaching someone we
+   * cannot yet talk to — which, once connected, is nobody.
+   */
+  const signalTo = (peerId, msg) => {
+    const link = links.get(peerId)
+    if (link?.open) {
+      link.send({ __plaza: 'signal', msg })
+      return
+    }
+    void sendTo(peerId, msg)
+  }
+
   const sendTo = async (peerId, msg) => {
-    if (left || !key) return
+    // Tracker discovery has no channel to a specific peer: the introduction is
+    // the whole conversation. Nothing here has anywhere to go.
+    if (left || !key || !rendezvous) return
     const topic = await topicOf(`plaza/${appId}/${roomId}/${peerId}`)
-    const sealed = await seal(key, { from: selfId, ...msg })
+    const sealed = await seal(key, { from: id, ...msg })
     await rendezvous.publish(topic, sealed)
+  }
+
+  const chases = new Map() // peerId -> {timer, attempts, rebuilds}
+
+  /** Stop chasing a peer, whether because it connected or because it left. */
+  const stopChasing = (peerId) => {
+    const chase = chases.get(peerId)
+    if (chase) clearTimeout(chase.timer)
+    chases.delete(peerId)
+  }
+
+  /**
+   * Keep telling a peer we are here until the connection opens.
+   *
+   * Sent to their own topic rather than the room's: a direct message is the
+   * one thing that can rescue the asymmetric case, where they never heard our
+   * broadcast. Marked as a chase so it cannot ping-pong — a chase is answered
+   * by connecting, not by chasing back.
+   */
+  const chase = (peerId) => {
+    if (left || chases.has(peerId)) return
+    const state = { timer: null, attempts: 0, rebuilds: 0 }
+    chases.set(peerId, state)
+
+    const tick = () => {
+      if (left || !chases.has(peerId)) return
+      const link = links.get(peerId)
+
+      if (link && link.open) { stopChasing(peerId); return }
+
+      state.attempts++
+      const delay = chaseSchedule[Math.min(state.attempts - 1, chaseSchedule.length - 1)]
+
+      if (state.attempts > rebuildAfter) {
+        // Chasing has not worked. The connection itself may be the problem —
+        // a half-open handshake, candidates that went nowhere — so throw it
+        // away and build a fresh one rather than nursing it. Announce first,
+        // so they are ready for the new offer.
+        state.attempts = 0
+        state.rebuilds++
+        note(peerId, 'rebuilding', `no connection after ${rebuildAfter} attempts (rebuild ${state.rebuilds})`)
+        link?.die('rebuilding after failed discovery')
+        links.delete(peerId)
+        void sendTo(peerId, { type: 'announce', chase: true })
+        linkFor(peerId)
+      } else {
+        note(peerId, 'chasing', `attempt ${state.attempts}, still ${link ? link.pc.connectionState : 'no link'}`)
+        void sendTo(peerId, { type: 'announce', chase: true })
+      }
+
+      state.timer = setTimeout(tick, delay)
+    }
+
+    state.timer = setTimeout(tick, chaseSchedule[0])
   }
 
   const linkFor = (peerId) => {
@@ -84,21 +202,23 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
     if (existing && !existing.dead) return existing
 
     const link = new Link({
-      selfId,
+      selfId: id,
       peerId,
       rtcConfig,
-      send: (msg) => void sendTo(peerId, msg),
+      send: (msg) => signalTo(peerId, msg),
       log: (what, detail) => note(peerId, what, detail),
       emit: (event, ...args) => handleLinkEvent(event, ...args),
     })
 
     links.set(peerId, link)
     note(peerId, 'link-created', link.polite ? 'polite (waits for offer)' : 'impolite (opens channel)')
+    chase(peerId)
     return link
   }
 
   const handleLinkEvent = (event, peerId, ...rest) => {
     if (event === 'open') {
+      stopChasing(peerId)
       note(peerId, 'connected')
       // Anything already being shared goes to the newcomer immediately.
       const link = links.get(peerId)
@@ -116,6 +236,9 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
       const why = rest[0]
       const link = links.get(peerId)
       const wasOpen = link?.open
+      // A rebuild kills the old link deliberately; that is not a departure and
+      // must not be reported as one.
+      if (why === 'rebuilding after failed discovery') return
       links.delete(peerId)
       // Reject anything waiting on this peer rather than leaving it hanging.
       for (const waiter of pings.get(peerId) ?? []) waiter.reject(new Error(why))
@@ -149,6 +272,10 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
       waiter?.resolve()
       return
     }
+    if (data?.__plaza === 'signal') {
+      void links.get(peerId)?.accept(data.msg)
+      return
+    }
     if (data?.__plaza === 'stream-meta') {
       // Metadata arrives beside the tracks, not inside them; hold it so the
       // next ontrack can be labelled.
@@ -173,18 +300,26 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
     if (left) return
     const msg = await open(key, raw)
     // Not ours: another room sharing this topic hash, or a different password.
-    if (!msg || typeof msg.from !== 'string' || msg.from === selfId) return
+    if (!msg || typeof msg.from !== 'string' || msg.from === id) return
 
     if (msg.type === 'announce') {
       const known = links.get(msg.from)
       if (!known || known.dead) {
-        note(msg.from, 'discovered', msg.direct ? 'answered our announce' : 'announced')
+        const how = msg.chase ? 'they chased us' : msg.direct ? 'answered our announce' : 'announced'
+        note(msg.from, 'discovered', how)
         linkFor(msg.from)
+      } else if (msg.chase && !known.open && !known.polite) {
+        // They are still waiting on us and we are the side that opens. Our
+        // offer evidently never landed, so make another.
+        if (known.resendOffer()) {
+          note(msg.from, 'reoffering', 'they chased us while our offer was outstanding')
+        }
       }
+
       // Answer privately so a newcomer does not wait out an announce cycle.
-      // Only in response to a broadcast, or two peers answer each other
-      // forever.
-      if (!msg.direct) void sendTo(msg.from, { type: 'announce', direct: true })
+      // Only to a broadcast: answering a direct message, or a chase, would
+      // have two peers replying to each other forever.
+      if (!msg.direct && !msg.chase) void sendTo(msg.from, { type: 'announce', direct: true })
       return
     }
 
@@ -197,7 +332,7 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
 
   const announce = async () => {
     if (left) return
-    const sealed = await seal(key, { from: selfId, type: 'announce' })
+    const sealed = await seal(key, { from: id, type: 'announce' })
     await rendezvous.publish(roomTopic, sealed)
 
     // Frequent at first so a join feels immediate, then settling to a rate
@@ -207,15 +342,136 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
     announceTimer = setTimeout(announce, warmup ?? ANNOUNCE_MS)
   }
 
+  // ------------------------------------------------------------- trackers
+
+  const offered = new Map() // offerId -> Link awaiting an answer
+  let swarm = null
+
+  /**
+   * Make offers before knowing who they are for.
+   *
+   * A tracker introduces peers by handing out offers, so they have to exist
+   * first. This is the one place a pool of pending connections is genuinely
+   * required rather than inherited — and it stays small and short-lived,
+   * discarded whenever the next announce comes round.
+   */
+  const makeOffers = async (n) => {
+    if (left) return []
+
+    // Anything still unanswered from last time is stale: the peers who were
+    // going to answer it have had their chance.
+    for (const [offerId, link] of offered) {
+      link.die('offer went unanswered')
+      offered.delete(offerId)
+    }
+
+    const made = []
+    for (let i = 0; i < n; i++) {
+      const offerId = randomId()
+      const link = new Link({
+        selfId: id,
+        role: 'offer',
+        trickle: false,
+        rtcConfig,
+        send: (msg) => { if (link.peerId) signalTo(link.peerId, msg) },
+        log: (what, detail) => note(offerId, what, detail),
+        emit: (event, ...args) => handleLinkEvent(event, ...args),
+      })
+      try {
+        const sdp = await link.completeOffer()
+        if (!sdp) { link.die('no offer produced'); continue }
+        offered.set(offerId, link)
+        made.push({ offerId, sdp })
+      } catch (err) {
+        note('-', 'offer-failed', err?.message ?? String(err))
+        link.die('offer failed')
+      }
+    }
+    note('-', 'offers-published', `${made.length} for the swarm`)
+    return made
+  }
+
+  const answerOffer = async ({ peerId, offerId, sdp }) => {
+    if (left) return null
+    const existing = links.get(peerId)
+    if (existing && !existing.dead) {
+      note(peerId, 'offer-skipped', 'already connecting or connected')
+      return null
+    }
+
+    const link = new Link({
+      selfId: id,
+      peerId,
+      role: 'answer',
+      trickle: false,
+      rtcConfig,
+      send: (msg) => signalTo(peerId, msg),
+      log: (what, detail) => note(peerId, what, detail),
+      emit: (event, ...args) => handleLinkEvent(event, ...args),
+    })
+    links.set(peerId, link)
+    note(peerId, 'answering', `offer ${offerId.slice(0, 6)} from the swarm`)
+
+    try {
+      return await link.completeAnswer(sdp)
+    } catch (err) {
+      note(peerId, 'answer-failed', err?.message ?? String(err))
+      link.die('answer failed')
+      links.delete(peerId)
+      return null
+    }
+  }
+
+  const takeAnswer = ({ peerId, offerId, sdp }) => {
+    const link = offered.get(offerId)
+    if (!link) return
+    offered.delete(offerId)
+
+    const existing = links.get(peerId)
+    if (existing && !existing.dead) {
+      // Two of our offers were answered by the same peer, or they answered
+      // while we were already answering theirs. One connection each.
+      link.die('duplicate introduction')
+      return
+    }
+
+    link.identify(peerId)
+    links.set(peerId, link)
+    note(peerId, 'answered', `our offer ${offerId.slice(0, 6)}`)
+    void link.applyAnswer(sdp)
+  }
+
   const ready = (async () => {
     key = await roomKey({ appId, roomId, password })
     roomTopic = await topicOf(`plaza/${appId}/${roomId}`)
-    selfTopic = await topicOf(`plaza/${appId}/${roomId}/${selfId}`)
+    selfTopic = await topicOf(`plaza/${appId}/${roomId}/${id}`)
     if (left) return
 
-    rendezvous = new Rendezvous(relayUrls ?? DEFAULT_RELAYS, {
-      log: (what, detail) => note('-', what, detail),
-    })
+    // Injectable so discovery can be tested against a relay that loses
+    // traffic in one direction — the failure the chase exists for, and one
+    // that cannot be provoked reliably against real relays.
+    if (discovery !== 'tracker') {
+      rendezvous = makeRendezvous
+        ? makeRendezvous({ log: (what, detail) => note('-', what, detail) })
+        : new Rendezvous(relayUrls ?? DEFAULT_RELAYS, {
+          log: (what, detail) => note('-', what, detail),
+        })
+    }
+    if (discovery === 'tracker') {
+      // No relay topics and no announce loop: the swarm carries introductions
+      // itself, and the offers are the announcement.
+      swarm = new TrackerSwarm(trackerUrls ?? DEFAULT_TRACKERS, {
+        infoHash: await infoHashFor(`plaza/${appId}/${roomId}`),
+        peerId: id.padEnd(20, '0').slice(0, 20),
+        log: (what, detail) => note('-', what, detail),
+      })
+      swarm.onOffersNeeded = makeOffers
+      swarm.onOffer = answerOffer
+      swarm.onAnswer = takeAnswer
+      note('-', 'joined', `swarm via ${(trackerUrls ?? DEFAULT_TRACKERS).length} trackers`)
+      return
+    }
+
     rendezvous.listen(roomTopic, receive)
     rendezvous.listen(selfTopic, receive)
     note('-', 'joined', `room topic ${roomTopic.slice(0, 8)}`)
@@ -231,6 +487,7 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
 
   return {
     __plazaSignal: 'own',
+    selfId: id,
     ready,
     log,
 
@@ -307,10 +564,14 @@ export function joinRoom({ appId, password, rtcConfig, relayUrls } = {}, roomId)
       broadcast({ __plaza: 'leaving' })
       await new Promise((r) => setTimeout(r, 60))
 
+      for (const peerId of [...chases.keys()]) stopChasing(peerId)
       for (const link of links.values()) link.die('room left')
+      for (const link of offered.values()) link.die('room left')
       links.clear()
+      offered.clear()
       published.clear()
       rendezvous?.close()
+      swarm?.close()
     },
 
     get onPeerJoin() { return listeners.onPeerJoin },

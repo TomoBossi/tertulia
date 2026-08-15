@@ -110,7 +110,7 @@ export class Room extends Emitter {
     this.presence = { ...presence }
     this.#recover = recover
     this.transport = transport
-    if (transport === 'own') this.selfId = ownSelfId
+    if (transport === 'own') this.selfId = trysteroRoom.selfId ?? ownSelfId
 
     this.#wirePresence()
     this.#wireStreams()
@@ -137,7 +137,8 @@ export class Room extends Emitter {
    * the IP address of everyone in the room.
    */
   static async join({
-    room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true, transport = 'trystero',
+    room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true,
+    transport = 'trystero', discovery,
   } = {}) {
     if (!room || !String(room).trim()) {
       throw new Error('plaza: a room name is required')
@@ -156,6 +157,7 @@ export class Room extends Emitter {
       appId,
       ...(password ? { password } : {}),
       ...(rtcConfig ? { rtcConfig } : {}),
+      ...(discovery ? { discovery } : {}),
     }
     const name = String(room).trim()
 
