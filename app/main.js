@@ -128,6 +128,11 @@ async function enterCall(code, nick) {
   // difference between labels and ellipses.
   if (!LocalMedia.canShareScreen) $('[data-key="s"]').hidden = true
 
+  // Diagnostics were keyboard-only, which meant the one device most likely to
+  // be having trouble — a phone — was the one that could not report on it.
+  // On touch it takes the slot the share button just gave up.
+  if (TOUCH) $('[data-key="d"]').hidden = false
+
   float = new FloatChat($('#chat-float'))
   // A phone has no key to press, so the hint is only advice on how to fail.
   float.system(TOUCH ? `room ${code}` : `room ${code} · press ? for keys`)

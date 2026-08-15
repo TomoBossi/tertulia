@@ -291,20 +291,15 @@ export async function probeNat({ iceServers, timeout = 6000 } = {}) {
   try {
     pc.createDataChannel('nat-probe')
 
-    const seen = []
+    const srflx = []
+    const hostPorts = new Set()
+
     const done = new Promise((resolve) => {
       const finish = () => resolve()
       pc.onicecandidate = ({ candidate }) => {
         if (!candidate) return finish() // gathering complete
-        if (candidate.type === 'srflx') {
-          seen.push({
-            address: candidate.address,
-            port: candidate.port,
-            // The local socket this mapping was made for. Two srflx candidates
-            // sharing a base but not a port is the definition of the problem.
-            base: candidate.relatedPort,
-          })
-        }
+        if (candidate.type === 'host') hostPorts.add(candidate.port)
+        if (candidate.type === 'srflx') srflx.push({ address: candidate.address, port: candidate.port })
       }
       setTimeout(finish, timeout)
     })
@@ -312,33 +307,38 @@ export async function probeNat({ iceServers, timeout = 6000 } = {}) {
     await pc.setLocalDescription(await pc.createOffer())
     await done
 
-    result.candidates = seen
+    const mappings = new Set(srflx.map((c) => `${c.address}:${c.port}`))
+    result.candidates = [...mappings]
 
-    if (seen.length === 0) {
-      result.mapping = 'unknown'
+    if (mappings.size === 0) {
       result.detail = 'no reflexive candidate was gathered; STUN did not answer'
       return result
     }
 
-    const byBase = new Map()
-    for (const c of seen) {
-      const key = String(c.base ?? '?')
-      if (!byBase.has(key)) byBase.set(key, new Set())
-      byBase.get(key).add(`${c.address}:${c.port}`)
-    }
+    // The counting is subtle and worth stating, because getting it backwards
+    // inverts the verdict.
+    //
+    // Browsers discard a reflexive candidate identical to one already found,
+    // so several STUN servers all reporting the same mapping produce exactly
+    // one candidate. One mapping is therefore the *good* answer, not a
+    // shortage of evidence. A router that hands out a port per destination
+    // produces a distinct candidate per server instead.
+    //
+    // Comparing against the number of local sockets is what keeps that honest:
+    // a machine on wifi and ethernet at once legitimately has two of
+    // everything, and would otherwise look symmetric for having two mappings.
+    // Local ports are readable even when the addresses are hidden behind mDNS,
+    // which the relatedPort field is not — it reads zero there, which is why
+    // this does not group by it.
+    const sockets = Math.max(1, hostPorts.size)
 
-    const inconsistent = [...byBase.values()].some((s) => s.size > 1)
-    if (inconsistent) {
+    if (mappings.size > sockets) {
       result.mapping = 'address-dependent'
-      result.detail = 'a different external port per destination — direct connections cannot be made'
-    } else if (seen.length === 1) {
-      // One answer is consistent with itself and proves nothing. Say so
-      // rather than reporting a clean bill of health nobody earned.
-      result.mapping = 'inconclusive'
-      result.detail = 'only one STUN server answered, which cannot distinguish the two cases'
+      result.detail = `${mappings.size} external addresses for ${sockets} local socket`
+        + `${sockets === 1 ? '' : 's'} — a different port per destination, so direct connections cannot be made`
     } else {
       result.mapping = 'endpoint-independent'
-      result.detail = 'the same external port for every destination — direct connections work'
+      result.detail = 'every STUN server saw the same address — direct connections work'
     }
     return result
   } catch (err) {
