@@ -105,8 +105,17 @@ export class CallSession extends Emitter {
       this.emit('change')
     })
 
-    this.media.on('screen', (stream) => {
+    // Both ways of stopping a share end here.
+    //
+    // The browser draws its own "stop sharing" bar outside the page, and that
+    // is the one people actually press — so a share can end without this app
+    // being asked to end it. Handling only the button meant the peers were
+    // never told, and the last frame stayed frozen on their screens while the
+    // sharer saw the share cleanly stopped. Routing both through the same
+    // event is what makes them behave the same.
+    this.media.on('screen', (stream, ended) => {
       if (stream) this.room.addStream(stream, { kind: 'screen' })
+      else if (ended) this.room.removeStream(ended)
       this.emit('change')
     })
 
@@ -153,7 +162,9 @@ export class CallSession extends Emitter {
 
   async toggleScreen() {
     if (this.media.screenStream) {
-      this.room.removeStream(this.media.screenStream)
+      // Stopping the capture is enough: it raises the same event the
+      // browser's own stop button does, and that event does the removing.
+      // Two paths to the same outcome is how they came to differ.
       this.media.stopScreen()
       return
     }
