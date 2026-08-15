@@ -57,6 +57,7 @@ export class Room extends Emitter {
   #left = false
   #bitrate = null
   #playout = null
+  #bitrateJob = Promise.resolve()
   #restarts = new Map()
   #strained = new Set()
 
@@ -491,7 +492,27 @@ export class Room extends Emitter {
     return this.#bitrate
   }
 
-  async #applyBitrate() {
+  /**
+   * Apply the cap, one run at a time.
+   *
+   * setParameters is a read-modify-write against state the browser also owns.
+   * getParameters hands out a snapshot stamped with a transaction id, and the
+   * moment any write lands every other outstanding snapshot is stale — the
+   * browser rejects it rather than applying it, and the cap silently does not
+   * happen. Two callers overlapping is enough, and there are several: the room
+   * reapplies on join while the application reapplies on its own schedule,
+   * neither aware of the other.
+   *
+   * Serialising is the whole fix. Each run re-reads, so a call that queues
+   * behind another still writes current values.
+   */
+  #applyBitrate() {
+    const run = () => this.#applyBitrateOnce()
+    this.#bitrateJob = this.#bitrateJob.then(run, run)
+    return this.#bitrateJob
+  }
+
+  async #applyBitrateOnce() {
     if (!this.#bitrate) return
     const { video, audio } = this.#bitrate
 
@@ -501,7 +522,7 @@ export class Room extends Emitter {
         const cap = kind === 'video' ? video : kind === 'audio' ? audio : null
         if (!cap) continue
 
-        try {
+        const write = async () => {
           const params = sender.getParameters()
           // Firefox hands back parameters with no encodings until the first
           // negotiation completes; writing one in is harmless and required.
@@ -517,8 +538,20 @@ export class Room extends Emitter {
             encoding.priority = kind === 'audio' ? 'high' : 'low'
           }
           await sender.setParameters(params)
-        } catch (err) {
-          this.#note(peerId, 'bitrate-failed', `${kind}: ${err.message}`)
+        }
+
+        try {
+          await write()
+        } catch {
+          // One retry against a fresh snapshot. Renegotiation can invalidate
+          // one mid-flight through no fault of ours, and this is the mechanism
+          // that stops a sender burying a receiver — too important to let a
+          // single lost race turn it off for the rest of the call.
+          try {
+            await write()
+          } catch (err) {
+            this.#note(peerId, 'bitrate-failed', `${kind}: ${err.message}`)
+          }
         }
       }
     }
