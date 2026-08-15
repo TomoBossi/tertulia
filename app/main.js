@@ -532,7 +532,14 @@ function showDiag() {
 }
 
 function showInvite() {
-  const link = inviteUrl(roomCode)
+  // The mode travels with the invite. Without it a scanned QR silently puts
+  // the two devices on different signalling systems, where neither can ever
+  // see the other and nothing anywhere says why. Credentials are deliberately
+  // absent: an invite gets forwarded and screenshotted.
+  const link = inviteUrl(roomCode, undefined, {
+    signal: localStorage.getItem('tertulia:signal') || undefined,
+    discovery: localStorage.getItem('tertulia:discovery') || undefined,
+  })
   const matrix = qr(link)
 
   $('#overlay-card').innerHTML = `<h2>invite</h2>

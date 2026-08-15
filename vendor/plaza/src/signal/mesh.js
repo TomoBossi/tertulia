@@ -382,16 +382,22 @@ export function joinRoom(
       offered.delete(offerId)
     }
 
-    // A bound on how many connections may sit half-built at once, in case a
-    // tracker never introduces anyone and announces keep accumulating.
-    while (offered.size > MAX_PENDING_OFFERS) {
-      const [oldestId, oldest] = offered.entries().next().value
-      oldest.link.die('too many offers pending')
-      offered.delete(oldestId)
-    }
+    // Top up to a target rather than minting a fresh batch every time.
+    //
+    // Announcing every twenty seconds while offers live for two minutes means
+    // a fixed batch per announce accumulates far past any sensible bound, and
+    // capping it just makes the cap fight the lifetime: offers were being
+    // destroyed seconds after publication purely to make room for their
+    // replacements, which is the very race the lifetime was added to stop.
+    // Unanswered offers are still perfectly good, so they are re-announced
+    // rather than replaced.
+    const reusable = [...offered.entries()].map(([offerId, entry]) => ({
+      offerId, sdp: entry.sdp,
+    }))
+    const wanted = Math.max(0, Math.min(n, MAX_PENDING_OFFERS - reusable.length))
 
     const made = []
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < wanted; i++) {
       const offerId = randomId()
       const link = new Link({
         selfId: id,
@@ -405,15 +411,19 @@ export function joinRoom(
       try {
         const sdp = await link.completeOffer()
         if (!sdp) { link.die('no offer produced'); continue }
-        offered.set(offerId, { link, at: Date.now() })
+        offered.set(offerId, { link, at: Date.now(), sdp })
         made.push({ offerId, sdp })
       } catch (err) {
         note('-', 'offer-failed', err?.message ?? String(err))
         link.die('offer failed')
       }
     }
-    note('-', 'offers-published', `${made.length} for the swarm`)
-    return made
+    // Everything still outstanding goes out again alongside the new ones, so
+    // a tracker that introduces someone late still has something to hand over.
+    const publishing = [...reusable, ...made]
+    note('-', 'offers-published',
+      `${publishing.length} for the swarm (${made.length} new, ${reusable.length} still open)`)
+    return publishing
   }
 
   const answerOffer = async ({ peerId, offerId, sdp }) => {

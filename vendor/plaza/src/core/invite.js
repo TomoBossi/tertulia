@@ -67,11 +67,33 @@ export function normalizeRoom(input) {
   return raw.toLowerCase().replace(/\s+/g, '-')
 }
 
-/** Build the shareable link for a room. */
-export function inviteUrl(room, base = globalThis.location?.href ?? '') {
+/**
+ * Build the shareable link for a room.
+ *
+ * `settings` are carried in the query string, and choosing what may go there
+ * is the whole design of this function. A signalling mode is not a preference
+ * held by one device — it is a property of the meeting. Two peers on different
+ * transports cannot find each other by any amount of trying, and the failure
+ * is completely silent from both sides: each announces into a system the other
+ * is not listening to. A link that drops the mode therefore does not share the
+ * room at all, it shares a room that only works if the other person happens to
+ * have configured themselves identically.
+ *
+ * Credentials are a different matter and never travel. An invite gets
+ * forwarded, screenshotted and pasted into group chats; a relay password in it
+ * is a password published. Only the caller-supplied settings appear here, so
+ * anything secret simply is not passed in.
+ */
+export function inviteUrl(room, base = globalThis.location?.href ?? '', settings = {}) {
   const url = new URL(base || 'https://example.invalid/')
-  url.hash = `room=${encodeURIComponent(room)}`
   url.search = ''
+
+  for (const [key, value] of Object.entries(settings)) {
+    if (value === undefined || value === null || value === '') continue
+    url.searchParams.set(key, String(value))
+  }
+
+  url.hash = `room=${encodeURIComponent(room)}`
   return url.toString()
 }
 
