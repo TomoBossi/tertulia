@@ -52,6 +52,15 @@ const CHASE_MS = [1000, 2000, 4000, 6000, 8000]
 const REBUILD_AFTER_CHASES = 5
 
 /**
+ * How long an unanswered offer stays usable, and how many may wait at once.
+ *
+ * A tracker forwards offers on its own schedule; two minutes is far longer
+ * than any of them takes, so an answer always finds its connection alive.
+ */
+const OFFER_TTL_MS = 120000
+const MAX_PENDING_OFFERS = 12
+
+/**
  * This page's identity, one per load, matching the vendored transport's shape.
  *
  * Deliberately global: a page is one peer, and two rooms open at once are the
@@ -352,17 +361,33 @@ export function joinRoom(
    *
    * A tracker introduces peers by handing out offers, so they have to exist
    * first. This is the one place a pool of pending connections is genuinely
-   * required rather than inherited — and it stays small and short-lived,
-   * discarded whenever the next announce comes round.
+   * required rather than inherited.
+   *
+   * Offers outlive the announce that published them. They used to be
+   * discarded as each new announce went out, which raced the tracker: an
+   * offer is held and forwarded on the tracker's schedule, not ours, so a
+   * peer would receive one, answer it faithfully, and find the connection
+   * behind it already destroyed. Both sides then spent ten seconds failing
+   * to reach a socket that had been closed before the answer was written.
+   * They now expire on their own clock, comfortably longer than any tracker
+   * takes to make an introduction.
    */
   const makeOffers = async (n) => {
     if (left) return []
 
-    // Anything still unanswered from last time is stale: the peers who were
-    // going to answer it have had their chance.
-    for (const [offerId, link] of offered) {
-      link.die('offer went unanswered')
+    const now = Date.now()
+    for (const [offerId, entry] of offered) {
+      if (now - entry.at < OFFER_TTL_MS) continue
+      entry.link.die('offer expired unanswered')
       offered.delete(offerId)
+    }
+
+    // A bound on how many connections may sit half-built at once, in case a
+    // tracker never introduces anyone and announces keep accumulating.
+    while (offered.size > MAX_PENDING_OFFERS) {
+      const [oldestId, oldest] = offered.entries().next().value
+      oldest.link.die('too many offers pending')
+      offered.delete(oldestId)
     }
 
     const made = []
@@ -380,7 +405,7 @@ export function joinRoom(
       try {
         const sdp = await link.completeOffer()
         if (!sdp) { link.die('no offer produced'); continue }
-        offered.set(offerId, link)
+        offered.set(offerId, { link, at: Date.now() })
         made.push({ offerId, sdp })
       } catch (err) {
         note('-', 'offer-failed', err?.message ?? String(err))
@@ -423,8 +448,12 @@ export function joinRoom(
   }
 
   const takeAnswer = ({ peerId, offerId, sdp }) => {
-    const link = offered.get(offerId)
-    if (!link) return
+    const entry = offered.get(offerId)
+    if (!entry) {
+      note(peerId, 'answer-unmatched', `offer ${offerId.slice(0, 6)} is no longer held`)
+      return
+    }
+    const link = entry.link
     offered.delete(offerId)
 
     const existing = links.get(peerId)
@@ -566,7 +595,7 @@ export function joinRoom(
 
       for (const peerId of [...chases.keys()]) stopChasing(peerId)
       for (const link of links.values()) link.die('room left')
-      for (const link of offered.values()) link.die('room left')
+      for (const entry of offered.values()) entry.link.die('room left')
       links.clear()
       offered.clear()
       published.clear()

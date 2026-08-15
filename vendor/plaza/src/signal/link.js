@@ -37,6 +37,33 @@ export const isPolite = (selfId, peerId) => selfId > peerId
  */
 const GATHER_TIMEOUT_MS = 4000
 
+/**
+ * Public STUN servers, always included.
+ *
+ * Without these a connection gathers host candidates only — the machine's own
+ * LAN addresses — which work beautifully between two tabs on one computer and
+ * cannot possibly work between two networks. That combination is a trap: every
+ * local test passes and every real call fails with `ice failed` after ten
+ * seconds of trying addresses nobody outside the house can reach.
+ *
+ * They are merged with the caller's configuration rather than replaced by it,
+ * so supplying a TURN server adds a relay without silently removing the means
+ * of avoiding one.
+ */
+export const DEFAULT_ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+]
+
+/** Merge caller configuration over the defaults, keeping both sets of servers. */
+export function iceConfiguration(rtcConfig) {
+  return {
+    ...rtcConfig,
+    iceServers: [...DEFAULT_ICE_SERVERS, ...(rtcConfig?.iceServers ?? [])],
+  }
+}
+
 export class Link {
   /** @type {RTCPeerConnection} */ pc
   /** @type {RTCDataChannel|null} */ channel = null
@@ -84,7 +111,7 @@ export class Link {
     this.#emit = emit
     this.#log = log
 
-    this.pc = new RTCPeerConnection(rtcConfig)
+    this.pc = new RTCPeerConnection(iceConfiguration(rtcConfig))
     this.#wire()
 
     // The offering side owns the channel, which is also what starts
