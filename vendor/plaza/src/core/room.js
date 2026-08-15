@@ -56,7 +56,9 @@ export class Room extends Emitter {
   #netTimer = null
   #left = false
   #bitrate = null
+  #playout = null
   #restarts = new Map()
+  #strained = new Set()
 
   constructor(trysteroRoom, { presence = {} } = {}) {
     super()
@@ -175,8 +177,10 @@ export class Room extends Emitter {
       // Raw channels are per peer connection and must be created for each one.
       for (const raw of this.#rawChannels.values()) raw.attach(peerId)
 
-      // A new peer means new senders, which do not inherit the cap.
+      // A new peer means new senders and receivers, which inherit neither the
+      // send cap nor the playout bound.
       await this.#applyBitrate()
+      await this.#applyPlayoutDelay()
 
       this.#note(peerId, 'join')
       this.emit('peer:join', peer)
@@ -187,6 +191,7 @@ export class Room extends Emitter {
       if (!peer) return
       this.peers.delete(peerId)
       this.#restarts.delete(peerId)
+      this.#strained.delete(peerId)
       for (const raw of this.#rawChannels.values()) raw.detach(peerId)
 
       this.#note(peerId, 'leave', `last seen ${peer.net.state}, path ${peer.net.path ?? '-'}`)
@@ -230,6 +235,11 @@ export class Room extends Emitter {
       peer.streams[kind] = stream
       this.emit('peer:stream', peer, stream, kind)
       this.emit('peer:update', peer)
+
+      // The receiver carrying this stream did not exist a moment ago, so
+      // whatever playout bound was set for the room has to be put on it now.
+      // Applying it only once, at join, would silently miss every track.
+      void this.#applyPlayoutDelay()
 
       // A remote stream stops by its tracks ending, not by a message, so the
       // only reliable notice that someone stopped sharing is this.
@@ -496,10 +506,73 @@ export class Room extends Emitter {
           // Firefox hands back parameters with no encodings until the first
           // negotiation completes; writing one in is harmless and required.
           if (!params.encodings?.length) params.encodings = [{}]
-          for (const encoding of params.encodings) encoding.maxBitrate = cap * 1000
+          for (const encoding of params.encodings) {
+            encoding.maxBitrate = cap * 1000
+
+            // When a path cannot carry everything, it should give up video
+            // before voice. A frozen picture is a call that continues; broken
+            // audio is a call that stops working. Left unset these compete as
+            // equals, and video — being far larger — wins by volume.
+            encoding.networkPriority = kind === 'audio' ? 'high' : 'low'
+            encoding.priority = kind === 'audio' ? 'high' : 'low'
+          }
           await sender.setParameters(params)
         } catch (err) {
           this.#note(peerId, 'bitrate-failed', `${kind}: ${err.message}`)
+        }
+      }
+    }
+  }
+
+  /**
+   * Bound how long receivers may hold incoming media before playing it.
+   *
+   * A receiver buffers to smooth out uneven arrival, and grows that buffer
+   * whenever packets come late. What it will not readily do is shrink it
+   * again: in continuous speech there is no quiet moment to catch up in, so a
+   * single rough patch can leave a conversation permanently a second behind
+   * while every other statistic reads perfectly healthy. The round trip says
+   * 5ms and the person still answers late, which is baffling until you know
+   * the delay is on the receiving end and self-inflicted.
+   *
+   * This is a genuine trade rather than a free win. A smaller buffer conceals
+   * less jitter, so some of what was delay becomes an audible glitch instead.
+   * For a conversation that is the right side of the trade — people talk over
+   * each other at half a second of delay, and stop being able to converse at
+   * all by a second — and for watching a screen share it is the wrong one.
+   *
+   * Values are milliseconds; null leaves the browser to decide.
+   */
+  async limitPlayoutDelay({ audio = null, video = null } = {}) {
+    this.#playout = { audio, video }
+    await this.#applyPlayoutDelay()
+    return this.#playout
+  }
+
+  async #applyPlayoutDelay() {
+    if (!this.#playout) return
+    const { audio, video } = this.#playout
+
+    for (const [peerId, pc] of Object.entries(this.#room.getPeers())) {
+      for (const receiver of pc.getReceivers()) {
+        const kind = receiver.track?.kind
+        const target = kind === 'video' ? video : kind === 'audio' ? audio : null
+        if (target == null) continue
+
+        try {
+          // jitterBufferTarget is the standard property, in milliseconds.
+          // playoutDelayHint predates it and takes seconds; browsers that have
+          // one generally lack the other, so both are offered and whichever
+          // exists takes effect.
+          if ('jitterBufferTarget' in receiver) {
+            receiver.jitterBufferTarget = target
+          } else if ('playoutDelayHint' in receiver) {
+            receiver.playoutDelayHint = target / 1000
+          } else {
+            continue
+          }
+        } catch (err) {
+          this.#note(peerId, 'playout-failed', `${kind}: ${err.message}`)
         }
       }
     }
@@ -527,7 +600,38 @@ export class Room extends Emitter {
       peer.net = net
       if (changed) this.emit('peer:net', peer, net)
 
+      this.#noteStrain(peerId, net)
       this.#maybeRestart(peerId, pc, net)
+    }
+  }
+
+  /**
+   * Record when a link starts or stops struggling, in a way the log survives.
+   *
+   * The log is the only artefact that outlives a call, and until now it only
+   * recorded state changes — join, connected, disconnected. A call that stayed
+   * "connected" throughout while being unusable left no trace at all, so the
+   * log agreed with the connection and disagreed with the person on it.
+   *
+   * Edge-triggered on purpose: a poll every two seconds writing a line every
+   * two seconds would bury the state changes that make the log readable.
+   */
+  #noteStrain(peerId, net) {
+    const strained =
+      (net.playoutDelay != null && net.playoutDelay > 400) ||
+      (net.remoteLoss != null && net.remoteLoss > 5)
+
+    const was = this.#strained.has(peerId)
+    if (strained === was) return
+
+    if (strained) {
+      this.#strained.add(peerId)
+      this.#note(peerId, 'strained',
+        `held ${net.playoutDelay ?? '-'}ms, they lose ${net.remoteLoss ?? '-'}% of ours, `
+        + `we lose ${net.packetLoss ?? '-'}% of theirs, rtt ${net.rtt ?? '-'}ms`)
+    } else {
+      this.#strained.delete(peerId)
+      this.#note(peerId, 'recovered', `held ${net.playoutDelay ?? '-'}ms`)
     }
   }
 

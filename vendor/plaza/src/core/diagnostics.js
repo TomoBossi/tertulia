@@ -14,11 +14,19 @@
 /**
  * Summarise a peer connection.
  *
+ * Note which direction each number describes. `packetLoss` is what *we* failed
+ * to receive; `remoteLoss` is what the far end reports failing to receive from
+ * us. They are routinely nothing alike, and a call where one person cannot be
+ * heard is precisely the case where only one of them moves. Reporting the
+ * inbound one alone makes the healthy direction look like the story.
+ *
  * @param {RTCPeerConnection} pc
  * @returns {Promise<{
  *   state: string, path: string|null, relayed: boolean, rtt: number|null,
  *   address: string|null, protocol: string|null,
- *   inboundKbps: number|null, outboundKbps: number|null, packetLoss: number|null
+ *   inboundKbps: number|null, outboundKbps: number|null, packetLoss: number|null,
+ *   remoteLoss: number|null, remoteJitter: number|null,
+ *   playoutDelay: number|null, freezeRatio: number|null
  * }>}
  */
 export async function watchConnection(pc) {
@@ -32,6 +40,10 @@ export async function watchConnection(pc) {
     inboundKbps: null,
     outboundKbps: null,
     packetLoss: null,
+    remoteLoss: null,
+    remoteJitter: null,
+    playoutDelay: null,
+    freezeRatio: null,
   }
 
   let stats
@@ -102,27 +114,67 @@ function throughput(stats, pc) {
   let packetsLost = 0
   let packetsReceived = 0
 
+  // How long the receiver is holding audio and video back before playing it.
+  // This is the number that explains a call where the connection is healthy
+  // and the person still answers a second late: the jitter buffer grew during
+  // a rough patch and, in continuous speech, has no quiet moment in which to
+  // shrink again. It is a *delay*, not a fault, and nothing else reports it.
+  let jitterDelay = 0
+  let jitterCount = 0
+
+  // Freezes are the visible half of the same story.
+  let freezeSeconds = 0
+  let videoSeconds = 0
+
+  // The far end's opinion of what we send it, carried back in RTCP receiver
+  // reports. Without this a sender is blind to its own outbound direction.
+  let remoteLost = null
+  let remoteJitter = null
+
   stats.forEach((report) => {
     if (report.type === 'inbound-rtp') {
       bytesIn += report.bytesReceived ?? 0
       packetsLost += report.packetsLost ?? 0
       packetsReceived += report.packetsReceived ?? 0
+      jitterDelay += report.jitterBufferDelay ?? 0
+      jitterCount += report.jitterBufferEmittedCount ?? 0
+      if (report.kind === 'video') {
+        freezeSeconds += report.totalFreezesDuration ?? 0
+        videoSeconds += report.totalInterFrameDelay ?? 0
+      }
     } else if (report.type === 'outbound-rtp') {
       bytesOut += report.bytesSent ?? 0
+    } else if (report.type === 'remote-inbound-rtp') {
+      if (typeof report.fractionLost === 'number') {
+        remoteLost = Math.max(remoteLost ?? 0, report.fractionLost)
+      }
+      if (typeof report.jitter === 'number') {
+        remoteJitter = Math.max(remoteJitter ?? 0, report.jitter)
+      }
     }
   })
+
+  const derived = {
+    // jitterBufferDelay is cumulative seconds across every frame emitted, so
+    // dividing by the count gives the average hold time per frame.
+    playoutDelay: jitterCount > 0 ? Math.round((jitterDelay / jitterCount) * 1000) : null,
+    remoteLoss: remoteLost == null ? null : Math.round(remoteLost * 1000) / 10,
+    remoteJitter: remoteJitter == null ? null : Math.round(remoteJitter * 1000),
+    freezeRatio: videoSeconds > 0 ? Math.round((freezeSeconds / videoSeconds) * 1000) / 10 : null,
+  }
 
   const now = performance.now()
   const previous = pc.__plazaSample
   pc.__plazaSample = { at: now, bytesIn, bytesOut }
 
-  if (!previous) return {}
+  if (!previous) return derived
 
   const seconds = (now - previous.at) / 1000
-  if (seconds <= 0) return {}
+  if (seconds <= 0) return derived
 
   const total = packetsLost + packetsReceived
   return {
+    ...derived,
     inboundKbps: Math.round(((bytesIn - previous.bytesIn) * 8) / seconds / 1000),
     outboundKbps: Math.round(((bytesOut - previous.bytesOut) * 8) / seconds / 1000),
     packetLoss: total > 0 ? Math.round((packetsLost / total) * 1000) / 10 : null,
@@ -160,6 +212,30 @@ export function describeConnection(net) {
       label: 'relayed',
       tone: 'warn',
       detail: 'Traffic is going through a relay rather than directly, which adds delay.',
+    }
+  }
+
+  // Held media outranks a slow path, because it is the failure people
+  // actually notice and the one no other number reveals. A round trip of 5ms
+  // and a playout delay of 900ms is a call nobody can hold a conversation on,
+  // and every other reading looks perfect.
+  if (net.playoutDelay != null && net.playoutDelay > 400) {
+    return {
+      label: 'delayed',
+      tone: 'warn',
+      detail: `${net.playoutDelay} ms of buffering on top of a ${net.rtt ?? '?'} ms path — `
+        + 'their side is holding media back to smooth over uneven arrival',
+    }
+  }
+
+  // Loss we are causing them, which a sender is otherwise blind to. The
+  // inbound figure describes the direction that is working.
+  if (net.remoteLoss != null && net.remoteLoss > 5) {
+    return {
+      label: 'lossy outbound',
+      tone: 'warn',
+      detail: `they are losing ${net.remoteLoss}% of what we send, `
+        + `while we lose ${net.packetLoss ?? 0}% of theirs`,
     }
   }
 

@@ -365,10 +365,14 @@ function showDiag() {
 
   const peers = [...room.peers.values()].map((p) => {
     const n = p.net ?? {}
+    // Two lines, split by direction. Mixing them reads as one healthy
+    // connection when in practice only one way round is working, which is
+    // the single most confusing thing a call can do.
     return `<div class="diag-peer"><b>${escapeHtml(p.nick || p.id.slice(0, 6))}</b>
       ${n.state ?? '?'} ${n.path ?? ''} ${n.relayed ? 'RELAYED' : ''}
-      <br>rtt ${n.rtt ?? '-'}ms · in ${n.inboundKbps ?? '-'}kbps · out ${n.outboundKbps ?? '-'}kbps
-      · loss ${n.packetLoss ?? '-'}%</div>`
+      <br>rtt ${n.rtt ?? '-'}ms · held ${n.playoutDelay ?? '-'}ms · freeze ${n.freezeRatio ?? '-'}%
+      <br>in ${n.inboundKbps ?? '-'}kbps loss ${n.packetLoss ?? '-'}%
+      · out ${n.outboundKbps ?? '-'}kbps loss ${n.remoteLoss ?? '-'}% jit ${n.remoteJitter ?? '-'}ms</div>`
   }).join('') || '<div class="diag-peer">nobody connected</div>'
 
   const log = room.log.slice(-40).reverse().map((e) => {

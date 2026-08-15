@@ -551,7 +551,13 @@ body.show-chrome #controls { opacity: 1; pointer-events: auto; }
     of "mic", and since a toggle sizes to its longest label that alone would
     push the row over on a narrow screen.
   */
-  #controls .chip.toggle { display: flex; }
+  /*
+    Centring has to be restated. The base rule centres with place-items, which
+    is a grid property and silently does nothing once this becomes a flex box —
+    so the label drops to flex-start and sits against the left edge of a button
+    that flex: 1 has just made wide.
+  */
+  #controls .chip.toggle { display: flex; align-items: center; justify-content: center; }
   #controls .chip.toggle .off-label { display: none; }
   #controls .chip.toggle .on-label { visibility: visible; }
   #chat-float { bottom: 96px; max-width: 78vw; }

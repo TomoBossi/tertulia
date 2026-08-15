@@ -184,6 +184,16 @@ export class CallSession extends Emitter {
     // burying a receiver that cannot decode that fast.
     await this.room.limitBitrate({ video: profile.maxBitrateKbps, audio: 48 })
 
+    // Cap how long the far side may hold our media before playing it.
+    //
+    // Without this a receiver that hit a rough patch keeps the buffer it grew,
+    // and a conversation ends up a second behind on a connection reporting
+    // five milliseconds. People talk over each other at half a second and stop
+    // being able to take turns at all much past it, so a glitch is the better
+    // failure: 150ms for voice, where turn-taking is the whole point, and more
+    // for video, which only has to stay roughly with the audio.
+    await this.room.limitPlayoutDelay({ audio: 150, video: 300 })
+
     for (const track of this.media.stream?.getVideoTracks() ?? []) {
       try {
         await track.applyConstraints({
