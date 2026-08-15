@@ -65,6 +65,7 @@ export class Room extends Emitter {
   #bitrate = null
   #playout = null
   #bitrateJob = Promise.resolve()
+  #bitrateRetry = null
 
   /**
    * Whether to intervene in a handshake that is going badly.
@@ -132,6 +133,16 @@ export class Room extends Emitter {
 
   #wirePresence() {
     this.#hello = this.#room.makeAction('plz.hello')
+    this.#unstream = this.#room.makeAction('plz.unstream')
+    this.#unstream.onMessage = (data, { peerId }) => {
+      const peer = this.peers.get(peerId)
+      const kind = typeof data?.kind === 'string' ? data.kind : null
+      if (!peer || !kind || !peer.streams[kind]) return
+
+      delete peer.streams[kind]
+      this.emit('peer:stream', peer, null, kind)
+      this.emit('peer:update', peer)
+    }
     this.#hello.onMessage = (data, { peerId }) => {
       const peer = this.#ensure(peerId)
       peer.presence = data && typeof data === 'object' ? data : {}
@@ -143,6 +154,7 @@ export class Room extends Emitter {
   }
 
   #hello
+  #unstream
 
   /**
    * Replace what we are broadcasting about ourselves.
@@ -316,8 +328,16 @@ export class Room extends Emitter {
 
   removeStream(stream) {
     if (!stream) return
+    const kind = this.#published.get(stream)
     this.#published.delete(stream)
     try { this.#room.removeStream(stream) } catch { /* never sent */ }
+
+    // Removal must be said out loud. Ending a stream reaches the far side as
+    // tracks going mute, not as tracks ending — renegotiation leaves the
+    // receiver's track alive and silent — so without a message the last frame
+    // of a stopped screen share stays on everyone's wall indefinitely,
+    // indistinguishable from a still presenter.
+    if (kind) this.#unstream.send({ kind }).catch(() => {})
   }
 
   /**
@@ -560,6 +580,7 @@ export class Room extends Emitter {
   async #applyBitrateOnce() {
     if (!this.#bitrate) return
     const { video, audio } = this.#bitrate
+    let needsRetry = false
 
     for (const [peerId, pc] of Object.entries(this.#room.getPeers())) {
       for (const sender of pc.getSenders()) {
@@ -567,38 +588,55 @@ export class Room extends Emitter {
         const cap = kind === 'video' ? video : kind === 'audio' ? audio : null
         if (!cap) continue
 
-        const write = async () => {
+        const write = async (withPriorities) => {
           const params = sender.getParameters()
-          // Firefox hands back parameters with no encodings until the first
-          // negotiation completes; writing one in is harmless and required.
-          if (!params.encodings?.length) params.encodings = [{}]
+
+          // No encodings means negotiation has not produced them yet, and
+          // fabricating an entry counts as modifying a read-only field on
+          // some Chromium builds — a field log from Android shows exactly
+          // that rejection. Skip now; the scheduled retry catches it.
+          if (!params.encodings?.length) return 'later'
+
           for (const encoding of params.encodings) {
             encoding.maxBitrate = cap * 1000
 
             // When a path cannot carry everything, it should give up video
             // before voice. A frozen picture is a call that continues; broken
-            // audio is a call that stops working. Left unset these compete as
-            // equals, and video — being far larger — wins by volume.
-            encoding.networkPriority = kind === 'audio' ? 'high' : 'low'
-            encoding.priority = kind === 'audio' ? 'high' : 'low'
+            // audio is a call that stops working. Not every browser lets
+            // these be written, which is why they are the first thing dropped
+            // on retry — the cap is the part that cannot be lost.
+            if (withPriorities) {
+              encoding.networkPriority = kind === 'audio' ? 'high' : 'low'
+              encoding.priority = kind === 'audio' ? 'high' : 'low'
+            }
           }
           await sender.setParameters(params)
+          return 'done'
         }
 
         try {
-          await write()
+          if ((await write(true)) === 'later') needsRetry = true
         } catch {
-          // One retry against a fresh snapshot. Renegotiation can invalidate
-          // one mid-flight through no fault of ours, and this is the mechanism
-          // that stops a sender burying a receiver — too important to let a
-          // single lost race turn it off for the rest of the call.
+          // Fresh snapshot, cap only. A renegotiation can invalidate a
+          // snapshot mid-flight, and some browsers reject the priority
+          // fields outright; neither is a reason to lose the cap.
           try {
-            await write()
+            if ((await write(false)) === 'later') needsRetry = true
           } catch (err) {
             this.#note(peerId, 'bitrate-failed', `${kind}: ${err.message}`)
           }
         }
       }
+    }
+
+    // One deferred pass for the senders negotiation had not finished with.
+    // Without it, a cap that arrives before the first answer never applies at
+    // all, and there is no later event to reapply it on.
+    if (needsRetry && !this.#bitrateRetry) {
+      this.#bitrateRetry = setTimeout(() => {
+        this.#bitrateRetry = null
+        if (!this.#left) void this.#applyBitrate()
+      }, 2000)
     }
   }
 
@@ -805,6 +843,8 @@ export class Room extends Emitter {
     this.#left = true
 
     clearInterval(this.#netTimer)
+    clearTimeout(this.#bitrateRetry)
+    this.#bitrateRetry = null
     for (const channel of [...this.#channels.values()]) channel.close()
     for (const raw of [...this.#rawChannels.values()]) raw.handle.close()
 

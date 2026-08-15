@@ -289,7 +289,8 @@ document.addEventListener('keydown', (e) => {
   if (!session || $('#call').hidden) return
   if (e.metaKey || e.ctrlKey || e.altKey) return
 
-  if (document.activeElement?.tagName === 'INPUT') {
+  const active = document.activeElement
+  if (active?.tagName === 'INPUT' && !active.closest('[hidden]')) {
     if (e.key === 'Escape') { e.preventDefault(); closePrompt() }
     return
   }
@@ -399,6 +400,10 @@ function toggleOverlay(name) {
 }
 
 function closeOverlay() {
+  // The invite overlay selects its link field for easy copying; anything
+  // focused in here must be let go, or a hidden input keeps swallowing every
+  // keystroke and the whole keyboard appears dead.
+  if ($('#overlay').contains(document.activeElement)) document.activeElement.blur()
   overlayName = null
   $('#overlay').hidden = true
 }
@@ -487,7 +492,7 @@ function showDiag() {
       unknown: 'could not tell',
     }[nat.mapping]
     natLine = `this network: ${nat.mapping} — ${verdict}` +
-      (nat.candidates.length ? ` [${nat.candidates.map((c) => `${c.address}:${c.port}`).join(' ')}]` : '')
+      (nat.candidates.length ? ` [${nat.candidates.join(' ')}]` : '')
     el.textContent = natLine
   })
 
