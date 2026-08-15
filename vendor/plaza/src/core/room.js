@@ -56,6 +56,13 @@ export class Room extends Emitter {
    */
   log = []
 
+  /**
+   * Every room currently open, so the console hook can find them. A Set of
+   * rooms rather than a captured reference, because the hook is installed
+   * once per page while rooms come and go.
+   */
+  static __live = new Set()
+
   #room
   #channels = new Map()
   #rawChannels = new Map()
@@ -94,6 +101,9 @@ export class Room extends Emitter {
     // Connection quality has no events in the underlying API, so it is polled.
     // Two seconds notices a peer degrading without draining a phone battery.
     this.#netTimer = setInterval(() => this.#pollNet(), 2000)
+
+    Room.__live.add(this)
+    this.#captureTransportErrors()
   }
 
   /**
@@ -240,15 +250,56 @@ export class Room extends Emitter {
       }
     }
 
-    this.#room.onPeerLeave = (peerId) => {
+    this.#room.onPeerLeave = (peerId, reason) => {
       const peer = this.peers.get(peerId)
       if (!peer) return
+
+      // Why, not just that. The transport distinguishes a goodbye from a
+      // dead channel from a failed handshake, and those need completely
+      // different responses — but it discarded the distinction before
+      // telling anyone, so every drop looked the same in the log. It is
+      // patched to pass it through; see vendor/PATCHES.md.
+      const why = reason?.message ?? 'no reason given'
+      const pc = this.#room.getPeers()[peerId]
+      const live = pc
+        ? `${pc.connectionState}/${pc.iceConnectionState}`
+        : 'connection already gone'
+
       this.peers.delete(peerId)
       this.#strained.delete(peerId)
       for (const raw of this.#rawChannels.values()) raw.detach(peerId)
 
-      this.#note(peerId, 'leave', `last seen ${peer.net.state}, path ${peer.net.path ?? '-'}`)
-      this.emit('peer:leave', peer)
+      this.#note(peerId, 'leave',
+        `${why} — last seen ${peer.net.state}, path ${peer.net.path ?? '-'}, now ${live}`)
+      this.emit('peer:leave', peer, reason)
+    }
+  }
+
+  /**
+   * Fold the transport's own complaints into this log.
+   *
+   * The transport reports peer errors by writing to the console and nowhere
+   * else. On a phone that console is unreachable — which is exactly where the
+   * failures happen — so its side of the story was lost every time. This
+   * mirrors those lines into the log the diagnostics panel can copy.
+   *
+   * Installed once per page, and it chains rather than replaces, so anything
+   * else listening still sees them.
+   */
+  #captureTransportErrors() {
+    if (typeof console === 'undefined' || console.__plazaCaptured) return
+    console.__plazaCaptured = true
+
+    for (const level of ['error', 'warn']) {
+      const original = console[level].bind(console)
+      console[level] = (...args) => {
+        original(...args)
+        const text = args.map((a) => a?.message ?? String(a)).join(' ')
+        if (!/trystero/i.test(text)) return
+        for (const room of Room.__live) {
+          room.#note('-', `transport-${level}`, text.slice(0, 200))
+        }
+      }
     }
   }
 
@@ -851,6 +902,7 @@ export class Room extends Emitter {
     this.#published.clear()
     try { await this.#room.leave() } catch { /* already gone */ }
 
+    Room.__live.delete(this)
     this.peers.clear()
     this.clearListeners()
   }
