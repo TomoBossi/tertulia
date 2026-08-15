@@ -1,4 +1,5 @@
-import { joinRoom as trysteroJoin, selfId } from '../../vendor/trystero.mjs'
+import { joinRoom as trysteroJoin, selfId as trysteroSelfId } from '../../vendor/trystero.mjs'
+import { joinRoom as ownJoin, selfId as ownSelfId } from '../signal/mesh.js'
 import { Emitter } from './emitter.js'
 import { watchConnection } from './diagnostics.js'
 
@@ -33,7 +34,23 @@ import { watchConnection } from './diagnostics.js'
  */
 export class Room extends Emitter {
   /** Our own peer id. Stable for the lifetime of the page. */
-  selfId = selfId
+  selfId = trysteroSelfId
+
+  /** Which signalling implementation is carrying this room. */
+  transport = 'trystero'
+
+  /**
+   * The transport's own log, when it keeps one.
+   *
+   * Discovery happens before any peer exists, so nothing in this room's log
+   * can describe a failure to find someone — which is exactly the failure
+   * worth describing. The alternative signalling records relay connects,
+   * retries and discoveries; surfacing it means a call that never started
+   * still leaves an account of why.
+   */
+  get transportLog() {
+    return this.#room?.log ?? []
+  }
 
   /** @type {Map<string, Peer>} everyone else in the room */
   peers = new Map()
@@ -87,11 +104,13 @@ export class Room extends Emitter {
   #watched = new WeakMap()
   #strained = new Set()
 
-  constructor(trysteroRoom, { presence = {}, recover = true } = {}) {
+  constructor(trysteroRoom, { presence = {}, recover = true, transport = 'trystero' } = {}) {
     super()
     this.#room = trysteroRoom
     this.presence = { ...presence }
     this.#recover = recover
+    this.transport = transport
+    if (transport === 'own') this.selfId = ownSelfId
 
     this.#wirePresence()
     this.#wireStreams()
@@ -117,7 +136,9 @@ export class Room extends Emitter {
    * setting: the handshake carries ICE candidates, and ICE candidates carry
    * the IP address of everyone in the room.
    */
-  static async join({ room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true } = {}) {
+  static async join({
+    room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true, transport = 'trystero',
+  } = {}) {
     if (!room || !String(room).trim()) {
       throw new Error('plaza: a room name is required')
     }
@@ -127,16 +148,25 @@ export class Room extends Emitter {
     // everyone reach into the bag for it.
     const initial = { ...(nick ? { nick: String(nick).slice(0, 60) } : {}), ...(presence ?? {}) }
 
-    const tr = trysteroJoin(
-      {
-        appId,
-        ...(password ? { password } : {}),
-        ...(rtcConfig ? { rtcConfig } : {}),
-      },
-      String(room).trim(),
-    )
+    // Two transports, one surface. The alternative exists to make "is this
+    // the transport or is it us" answerable by flipping a switch rather than
+    // by argument: identical application code, identical diagnostics, one
+    // variable. See src/signal/.
+    const config = {
+      appId,
+      ...(password ? { password } : {}),
+      ...(rtcConfig ? { rtcConfig } : {}),
+    }
+    const name = String(room).trim()
 
-    return new Room(tr, { presence: initial, recover })
+    const tr = transport === 'own' ? ownJoin(config, name) : trysteroJoin(config, name)
+    const roomInstance = new Room(tr, { presence: initial, recover, transport })
+
+    // The alternative resolves its keys and topics asynchronously; waiting
+    // means a caller that joins and immediately sends is not racing setup.
+    if (tr.ready) await tr.ready
+
+    return roomInstance
   }
 
   // ---------------------------------------------------------------- presence

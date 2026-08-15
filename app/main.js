@@ -135,7 +135,8 @@ function modeLine() {
   // demonstrably ran a stale cached build while a newer one was live, and
   // nothing in the log said so — every conclusion drawn from it was about the
   // wrong code. A log that does not say what produced it is a trap.
-  return `settings: recovery ${opts.recover === false ? 'OFF' : 'on'}`
+  return `settings: signalling ${opts.transport ?? 'trystero'}`
+    + `, recovery ${opts.recover === false ? 'OFF' : 'on'}`
     + `, relay ${relay ? String(relay.urls) : 'none'}`
     + `, page built ${document.lastModified}`
 }
@@ -143,7 +144,7 @@ function modeLine() {
 function connectionOptions() {
   const params = new URLSearchParams(location.search)
 
-  for (const key of ['turn', 'turnUser', 'turnPass', 'ice']) {
+  for (const key of ['turn', 'turnUser', 'turnPass', 'ice', 'signal']) {
     const value = params.get(key)
     if (value !== null) localStorage.setItem(`tertulia:${key}`, value)
   }
@@ -151,6 +152,10 @@ function connectionOptions() {
 
   const options = {}
   if (setting('ice') === 'off') options.recover = false
+
+  // ?signal=own runs plaza's own signalling instead of the vendored transport.
+  // Identical application code either way — that is the point.
+  if (setting('signal') === 'own') options.transport = 'own'
 
   const turn = setting('turn')
   if (turn) {
@@ -460,7 +465,14 @@ function showDiag() {
       · out ${n.outboundKbps ?? '-'}kbps loss ${n.remoteLoss ?? '-'}% jit ${n.remoteJitter ?? '-'}ms</div>`
   }).join('') || '<div class="diag-peer">nobody connected</div>'
 
-  const log = room.log.slice(-40).reverse().map((e) => {
+  // Both logs, newest first. The transport's covers discovery — everything
+  // that happens before a peer exists, which is where a call that never
+  // started fails.
+  const merged = [...room.log, ...room.transportLog]
+    .sort((a, b) => b.at - a.at)
+    .slice(0, 60)
+
+  const log = merged.map((e) => {
     const t = new Date(e.at).toLocaleTimeString()
     return `<div class="diag-line"><span class="t">${t}</span>
       <span class="p">${e.peer}</span>
@@ -500,8 +512,9 @@ function showDiag() {
     // The NAT verdict goes in the copied text too. It is the one line that
     // decides whether a connection failure is worth debugging at all, and it
     // is useless if it only ever appears on a screen nobody screenshots.
-    const text = [modeLine(), natLine, ...room.log.map((e) =>
-      `${new Date(e.at).toISOString()} ${e.peer} ${e.what} ${e.detail ?? ''}`)].join('\n')
+    const text = [modeLine(), natLine, ...[...room.log, ...room.transportLog]
+      .sort((a, b) => a.at - b.at)
+      .map((e) => `${new Date(e.at).toISOString()} ${e.peer} ${e.what} ${e.detail ?? ''}`)].join('\n')
     try {
       await navigator.clipboard.writeText(text)
       $('#diag-copy').textContent = 'copied'

@@ -79,3 +79,34 @@ failing — is reported through other paths and still tears the peer down.
 Reapply after re-vendoring: find the catch block in the candidate branch of
 `signal()` carrying the message "failed to parse remote candidate" and make it
 an empty catch.
+
+## trystero.mjs — a peer with a slow clock must not become invisible
+
+Nostr subscriptions filter on `since`, taken from the subscriber's clock,
+against `created_at`, taken from the publisher's. Upstream subscribes with
+`since: now()`, so a peer whose clock runs even slightly behind ours has
+everything it publishes — announcements, offers, candidates — dropped by the
+relay before it reaches us. In one direction only, for the whole session.
+
+Measured against a live relay:
+
+```
+clock-in-sync            DELIVERED
+publisher-5s-behind      DROPPED BY RELAY
+publisher-60s-behind     DROPPED BY RELAY
+publisher-30s-ahead      DELIVERED
+```
+
+Five seconds is nothing. A phone and a desktop routinely differ by more, and
+the drift changes as each device re-syncs — which is what makes the resulting
+failure look random, device-pair-specific, and one-directional: the faster peer
+sees the slower one and offers; the slower one never hears the reply and shows
+nothing, while the faster one sits on a half-open attempt reading "connecting".
+
+The patch subtracts ten minutes of slack. These are ephemeral events, which
+relays do not store, so a wider window receives no backlog — it only stops
+excluding.
+
+Reapply after re-vendoring: both subscription builders in the nostr strategy
+(the single-topic `REQ` and the batched flush) take `since: <now>()`; subtract
+600 from each.
