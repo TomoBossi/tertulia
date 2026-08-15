@@ -163,14 +163,18 @@ export function describeConnection(net) {
     }
   }
 
-  const quality = net.rtt == null ? 'good'
-    : net.rtt < 80 ? 'good'
-      : net.rtt < 200 ? 'ok'
-        : 'poor'
+  // A call between continents is 250-300ms and there is nothing wrong with
+  // it — that is the speed of light through fibre, not a fault. Flagging it
+  // teaches people to ignore the warning, so the threshold sits above what
+  // distance alone can explain. Past roughly 350ms something other than
+  // geography is involved.
+  const strained = net.rtt != null && net.rtt > 350
 
   return {
     label: net.path === 'host/host' ? 'direct (local)' : 'direct',
-    tone: quality === 'poor' ? 'warn' : 'good',
-    detail: net.rtt != null ? `${net.rtt} ms round trip` : '',
+    tone: strained ? 'warn' : 'good',
+    detail: net.rtt == null ? ''
+      : strained ? `${net.rtt} ms round trip — higher than distance alone explains`
+        : `${net.rtt} ms round trip`,
   }
 }
