@@ -254,3 +254,97 @@ export function describeConnection(net) {
         : `${net.rtt} ms round trip`,
   }
 }
+
+/**
+ * Ask what kind of NAT this machine is behind.
+ *
+ * This is the question that decides whether two people can be connected
+ * directly at all, and until now nothing in the stack could answer it. A
+ * handshake that hangs at `checking` looks identical whether the cause is a
+ * temporary blip, a stale address, or a NAT that makes direct connection
+ * permanently impossible — and only the last one is worth changing plans over.
+ *
+ * The test is to ask several STUN servers from the *same* local socket. A
+ * router that assigns one external port per internal socket gives the same
+ * answer to all of them, and a peer told that address can reach you on it.
+ * One that assigns a fresh port per destination gives a different answer to
+ * each, which means the address your peer is given is by construction not the
+ * one they will arrive on — the mapping is dead before it is sent. No amount
+ * of hole punching fixes that. It needs a relay.
+ *
+ * Running several STUN servers on one connection rather than one each is the
+ * whole trick: separate connections use separate sockets, so they would report
+ * different ports even behind the most cooperative router in the world, and
+ * the test would say "symmetric" everywhere.
+ */
+export async function probeNat({ iceServers, timeout = 6000 } = {}) {
+  const result = { mapping: 'unknown', candidates: [], detail: '' }
+
+  let pc
+  try {
+    pc = new RTCPeerConnection({ iceServers })
+  } catch (err) {
+    result.detail = err.message
+    return result
+  }
+
+  try {
+    pc.createDataChannel('nat-probe')
+
+    const seen = []
+    const done = new Promise((resolve) => {
+      const finish = () => resolve()
+      pc.onicecandidate = ({ candidate }) => {
+        if (!candidate) return finish() // gathering complete
+        if (candidate.type === 'srflx') {
+          seen.push({
+            address: candidate.address,
+            port: candidate.port,
+            // The local socket this mapping was made for. Two srflx candidates
+            // sharing a base but not a port is the definition of the problem.
+            base: candidate.relatedPort,
+          })
+        }
+      }
+      setTimeout(finish, timeout)
+    })
+
+    await pc.setLocalDescription(await pc.createOffer())
+    await done
+
+    result.candidates = seen
+
+    if (seen.length === 0) {
+      result.mapping = 'unknown'
+      result.detail = 'no reflexive candidate was gathered; STUN did not answer'
+      return result
+    }
+
+    const byBase = new Map()
+    for (const c of seen) {
+      const key = String(c.base ?? '?')
+      if (!byBase.has(key)) byBase.set(key, new Set())
+      byBase.get(key).add(`${c.address}:${c.port}`)
+    }
+
+    const inconsistent = [...byBase.values()].some((s) => s.size > 1)
+    if (inconsistent) {
+      result.mapping = 'address-dependent'
+      result.detail = 'a different external port per destination — direct connections cannot be made'
+    } else if (seen.length === 1) {
+      // One answer is consistent with itself and proves nothing. Say so
+      // rather than reporting a clean bill of health nobody earned.
+      result.mapping = 'inconclusive'
+      result.detail = 'only one STUN server answered, which cannot distinguish the two cases'
+    } else {
+      result.mapping = 'endpoint-independent'
+      result.detail = 'the same external port for every destination — direct connections work'
+    }
+    return result
+  } catch (err) {
+    result.detail = err.message
+    return result
+  } finally {
+    try { pc.close() } catch { /* already gone */ }
+  }
+}

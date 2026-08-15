@@ -9,7 +9,7 @@ import { watchConnection } from './diagnostics.js'
  * candidate pair over 4G can genuinely take several seconds to nominate — and
  * short enough that a person has not yet given up and reloaded.
  */
-const STALL_MS = 8000
+const STALL_MS = 12000
 
 /**
  * A room: the people in it, what they are broadcasting about themselves, and
@@ -795,7 +795,12 @@ export class Room extends Emitter {
         const state = pc.iceConnectionState
         if (state !== 'checking' && state !== 'new') return
         this.#restartIce(peerId, pc, `still ${state} after ${STALL_MS * n / 1000}s; regathering`)
-        if (n < 3) attempt(n + 1)
+
+        // Once. A regather abandons checks that may have been seconds from
+        // succeeding, and a handshake that has now failed twice is not going
+        // to be talked round by a third attempt — it is telling us the two
+        // networks cannot be joined directly at all.
+        if (n < 2) attempt(n + 1)
       }, STALL_MS)
       this.#stalls.set(peerId, timer)
     }

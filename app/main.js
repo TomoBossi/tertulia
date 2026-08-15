@@ -1,4 +1,4 @@
-import { join, generateRoomCode, normalizeRoom, roomFromUrl, inviteUrl, qr, qrPath } from 'plaza'
+import { join, generateRoomCode, normalizeRoom, roomFromUrl, inviteUrl, qr, qrPath, probeNat } from 'plaza'
 import { LocalMedia, resumeAudio } from 'mirador'
 
 import { CallSession } from './session.js'
@@ -12,6 +12,7 @@ let stage = null
 let float = null
 let overlayName = null
 let roomCode = ''
+let natLine = 'this network: not probed'
 
 /**
  * The whole transcript for this session.
@@ -391,14 +392,38 @@ function showDiag() {
   }).join('') || '<div class="diag-line">nothing logged yet</div>'
 
   $('#overlay-card').innerHTML =
-    `<h2>diagnostics</h2>${peers}<div class="diag-log">${log}</div>
+    `<h2>diagnostics</h2>
+     <div class="diag-peer" id="diag-nat">this network: checking…</div>
+     ${peers}<div class="diag-log">${log}</div>
      <div class="link-row" style="margin-top:10px">
        <button id="diag-copy" type="button">copy log</button>
      </div>`
 
+  // Asked here rather than at startup: it costs a STUN round trip, and it
+  // only matters once somebody is looking at why a call will not connect.
+  probeNat({ iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+  ] }).then((nat) => {
+    const el = $('#diag-nat')
+    if (!el) return
+    const verdict = {
+      'endpoint-independent': 'direct connections work',
+      'address-dependent': 'DIRECT CONNECTIONS IMPOSSIBLE — needs a relay',
+      inconclusive: 'could not tell',
+      unknown: 'could not tell',
+    }[nat.mapping]
+    natLine = `this network: ${nat.mapping} — ${verdict}` +
+      (nat.candidates.length ? ` [${nat.candidates.map((c) => `${c.address}:${c.port}`).join(' ')}]` : '')
+    el.textContent = natLine
+  })
+
   $('#diag-copy').addEventListener('click', async () => {
-    const text = room.log.map((e) =>
-      `${new Date(e.at).toISOString()} ${e.peer} ${e.what} ${e.detail ?? ''}`).join('\n')
+    // The NAT verdict goes in the copied text too. It is the one line that
+    // decides whether a connection failure is worth debugging at all, and it
+    // is useless if it only ever appears on a screen nobody screenshots.
+    const text = [natLine, ...room.log.map((e) =>
+      `${new Date(e.at).toISOString()} ${e.peer} ${e.what} ${e.detail ?? ''}`)].join('\n')
     try {
       await navigator.clipboard.writeText(text)
       $('#diag-copy').textContent = 'copied'

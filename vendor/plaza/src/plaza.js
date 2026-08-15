@@ -58,7 +58,7 @@
 
 export { Room, join } from './core/room.js'
 export { Emitter } from './core/emitter.js'
-export { watchConnection, describeConnection } from './core/diagnostics.js'
+export { watchConnection, describeConnection, probeNat } from './core/diagnostics.js'
 
 export {
   generateRoomCode,
