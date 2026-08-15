@@ -82,13 +82,25 @@ export class Room extends Emitter {
   #restarts = new Map()
   #stalls = new Map()
   #rebuilds = new Map()
+
+  /**
+   * Whether to intervene in a handshake that is going badly.
+   *
+   * Off, the browser's own ICE machinery is left entirely alone. This exists
+   * to be switched: every recovery here is a guess about why a connection
+   * failed, and a guess that fires on a handshake which was about to succeed
+   * makes things worse, not better. Being able to turn the whole apparatus off
+   * is the only way to find out which it is doing.
+   */
+  #recover = true
   #watched = new WeakSet()
   #strained = new Set()
 
-  constructor(trysteroRoom, { presence = {} } = {}) {
+  constructor(trysteroRoom, { presence = {}, recover = true } = {}) {
     super()
     this.#room = trysteroRoom
     this.presence = { ...presence }
+    this.#recover = recover
 
     this.#wirePresence()
     this.#wireStreams()
@@ -111,7 +123,7 @@ export class Room extends Emitter {
    * setting: the handshake carries ICE candidates, and ICE candidates carry
    * the IP address of everyone in the room.
    */
-  static async join({ room, appId = 'plaza', password, nick, presence, rtcConfig } = {}) {
+  static async join({ room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true } = {}) {
     if (!room || !String(room).trim()) {
       throw new Error('plaza: a room name is required')
     }
@@ -130,7 +142,7 @@ export class Room extends Emitter {
       String(room).trim(),
     )
 
-    return new Room(tr, { presence: initial })
+    return new Room(tr, { presence: initial, recover })
   }
 
   // ---------------------------------------------------------------- presence
@@ -762,6 +774,7 @@ export class Room extends Emitter {
 
   #onIceState(peerId, pc) {
     if (this.#left) return
+    if (!this.#recover) return
     const state = pc.iceConnectionState
 
     if (state === 'connected' || state === 'completed') {

@@ -102,6 +102,67 @@ $('#join-form').addEventListener('submit', async (e) => {
   }
 })
 
+/**
+ * Anything that changes how the connection itself is made.
+ *
+ * Both of these are settings rather than features, and both exist because
+ * connecting two particular networks is not something the app can decide from
+ * the inside.
+ *
+ * `?ice=off` leaves the browser's ICE machinery entirely alone. Every recovery
+ * the library performs is a guess about why a handshake was failing, and a
+ * guess that fires on one about to succeed makes it worse. Turning the whole
+ * apparatus off is the only honest way to find out which it is doing.
+ *
+ * `?turn=` supplies a relay. Some pairs of networks cannot be joined directly
+ * at all — a router that hands out a different port per destination gives a
+ * peer an address that is wrong before it is even sent — and no amount of
+ * retrying changes that. A relay is the only fix, and since it carries every
+ * byte of the call it has to be someone's, which is why there is not one built
+ * in.
+ *
+ * Both persist, so a phone only has to be given them once. Neither is ever put
+ * in an invite link: those are shared, and a TURN credential is a password.
+ */
+/** Which connection settings are in force, so a log says what produced it. */
+function modeLine() {
+  const opts = connectionOptions()
+  const relay = opts.rtcConfig
+    ? opts.rtcConfig.iceServers.find((s) => String(s.urls).includes('turn'))
+    : null
+  return `settings: recovery ${opts.recover === false ? 'OFF' : 'on'}`
+    + `, relay ${relay ? String(relay.urls) : 'none'}`
+}
+
+function connectionOptions() {
+  const params = new URLSearchParams(location.search)
+
+  for (const key of ['turn', 'turnUser', 'turnPass', 'ice']) {
+    const value = params.get(key)
+    if (value !== null) localStorage.setItem(`tertulia:${key}`, value)
+  }
+  const setting = (key) => localStorage.getItem(`tertulia:${key}`) || ''
+
+  const options = {}
+  if (setting('ice') === 'off') options.recover = false
+
+  const turn = setting('turn')
+  if (turn) {
+    options.rtcConfig = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        {
+          urls: turn.split(',').map((u) => u.trim()).filter(Boolean),
+          username: setting('turnUser'),
+          credential: setting('turnPass'),
+        },
+      ],
+    }
+  }
+  return options
+}
+
 // ------------------------------------------------------------------- call
 
 async function enterCall(code, nick) {
@@ -112,7 +173,7 @@ async function enterCall(code, nick) {
   // start. Any later and every meter silently reads zero.
   await resumeAudio()
 
-  const room = await join({ room: code, appId: 'tertulia', nick })
+  const room = await join({ room: code, appId: 'tertulia', nick, ...connectionOptions() })
   session = new CallSession({ room, media, nick })
 
   $('#landing').hidden = true
@@ -398,6 +459,7 @@ function showDiag() {
 
   $('#overlay-card').innerHTML =
     `<h2>diagnostics</h2>
+     <div class="diag-peer" id="diag-mode">${escapeHtml(modeLine())}</div>
      <div class="diag-peer" id="diag-nat">this network: checking…</div>
      ${peers}<div class="diag-log">${log}</div>
      <div class="link-row" style="margin-top:10px">
@@ -427,7 +489,7 @@ function showDiag() {
     // The NAT verdict goes in the copied text too. It is the one line that
     // decides whether a connection failure is worth debugging at all, and it
     // is useless if it only ever appears on a screen nobody screenshots.
-    const text = [natLine, ...room.log.map((e) =>
+    const text = [modeLine(), natLine, ...room.log.map((e) =>
       `${new Date(e.at).toISOString()} ${e.peer} ${e.what} ${e.detail ?? ''}`)].join('\n')
     try {
       await navigator.clipboard.writeText(text)
