@@ -130,7 +130,7 @@ function modeLine() {
   const relay = opts.rtcConfig
     ? opts.rtcConfig.iceServers.find((s) => String(s.urls).includes('turn'))
     : null
-  return `settings: recovery ${opts.recover === false ? 'OFF' : 'on'}`
+  return `settings: recovery ${opts.recover === false ? 'OFF' : opts.recover || 'on'}`
     + `, relay ${relay ? String(relay.urls) : 'none'}`
 }
 
@@ -144,7 +144,9 @@ function connectionOptions() {
   const setting = (key) => localStorage.getItem(`tertulia:${key}`) || ''
 
   const options = {}
-  if (setting('ice') === 'off') options.recover = false
+  const ice = setting('ice')
+  if (ice === 'off') options.recover = false
+  if (ice === 'aggressive') options.recover = 'aggressive'
 
   const turn = setting('turn')
   if (turn) {

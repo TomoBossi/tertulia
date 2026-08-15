@@ -79,8 +79,6 @@ export class Room extends Emitter {
   #bitrate = null
   #playout = null
   #bitrateJob = Promise.resolve()
-  #restarts = new Map()
-  #stalls = new Map()
   #rebuilds = new Map()
 
   /**
@@ -93,7 +91,7 @@ export class Room extends Emitter {
    * is the only way to find out which it is doing.
    */
   #recover = true
-  #watched = new WeakSet()
+  #watched = new WeakMap()
   #strained = new Set()
 
   constructor(trysteroRoom, { presence = {}, recover = true } = {}) {
@@ -249,9 +247,7 @@ export class Room extends Emitter {
       const peer = this.peers.get(peerId)
       if (!peer) return
       this.peers.delete(peerId)
-      this.#restarts.delete(peerId)
       this.#strained.delete(peerId)
-      this.#clearStall(peerId)
       for (const raw of this.#rawChannels.values()) raw.detach(peerId)
 
       this.#note(peerId, 'leave', `last seen ${peer.net.state}, path ${peer.net.path ?? '-'}`)
@@ -759,10 +755,13 @@ export class Room extends Emitter {
    */
   #watchIce(peerId, pc) {
     if (this.#watched.has(pc)) return
-    this.#watched.add(pc)
+    // Per connection, not per peer. The transport replaces this object
+    // whenever it rebuilds, and state kept under the peer's name outlives the
+    // connection it described: timers then fire against an object that is
+    // already dead, while the live one is refused a watcher because its peer
+    // "already has" one. The machinery goes inert and hostile at once.
+    this.#watched.set(pc, { restarted: false, stall: null })
 
-    // Guarded for the same reason the join steps are: recovery is a thing we
-    // would like to have, not a precondition for the peer being in the room.
     try {
       const onChange = () => this.#onIceState(peerId, pc)
       pc.addEventListener('iceconnectionstatechange', onChange)
@@ -773,29 +772,27 @@ export class Room extends Emitter {
   }
 
   #onIceState(peerId, pc) {
-    if (this.#left) return
-    if (!this.#recover) return
+    if (this.#left || !this.#recover) return
+    const own = this.#watched.get(pc)
+    if (!own) return
+
     const state = pc.iceConnectionState
 
     if (state === 'connected' || state === 'completed') {
-      this.#restarts.delete(peerId)
-      this.#clearStall(peerId)
-      // A call that connects has spent none of its budget. Carrying a count
-      // forward would leave a long conversation that hiccups an hour in with
-      // no attempts left for a problem it never had.
+      own.restarted = false
+      clearTimeout(own.stall)
+      own.stall = null
       this.#rebuilds.delete(peerId)
       return
     }
 
     if (state === 'disconnected' || state === 'failed') {
-      this.#clearStall(peerId)
-      if (this.#restarts.has(peerId)) return
-      this.#restarts.set(peerId, Date.now())
+      clearTimeout(own.stall)
+      own.stall = null
+      if (own.restarted) return
+      own.restarted = true
 
-      // Only one side may offer, or the two collide mid-renegotiation. The
-      // lower id goes at once; the other waits, purely as a backstop for the
-      // case where the first never noticed. One restart fixes the path in
-      // both directions, so the delay costs nothing when things work.
+      // Only one side offers, or the two collide mid-renegotiation.
       const delay = this.selfId < peerId ? 0 : 1200
       setTimeout(() => {
         if (this.#left) return
@@ -806,52 +803,35 @@ export class Room extends Emitter {
       return
     }
 
-    // `checking` and `new` have no deadline anywhere: the transport does not
-    // count them as failure, so a handshake that never completes hangs
-    // indefinitely and shows as "connecting" forever. That is what a stale
-    // candidate looks like — a peer that gathered a reflexive address minutes
-    // ago, whose NAT binding has since expired, so the address everyone is
-    // punching at is dead. Regathering is the only way out, and unlike the
-    // disconnected case nothing is racing us, so it is worth several tries.
-    this.#armStall(peerId, pc)
+    // A handshake still in progress. Nothing here is done by default: a
+    // regather abandons checks that may have been about to succeed, and there
+    // is no evidence it helps. Opt in with `aggressive` if a network turns out
+    // to need it.
+    if (this.#recover !== 'aggressive') return
+    if (own.stall) return
+    this.#armStall(peerId, pc, own)
   }
 
-  #armStall(peerId, pc) {
-    if (this.#stalls.has(peerId)) return
+  #armStall(peerId, pc, own) {
     const attempt = (n) => {
-      const timer = setTimeout(() => {
-        this.#stalls.delete(peerId)
+      own.stall = setTimeout(() => {
+        own.stall = null
         if (this.#left) return
         const state = pc.iceConnectionState
         if (state !== 'checking' && state !== 'new') return
+
         if (n <= STALL_RETRIES) {
           this.#restartIce(peerId, pc, `still ${state} after ${STALL_MS * n / 1000}s; regathering`)
           attempt(n + 1)
           return
         }
 
-        // Regathering has not worked, so stop reusing this attempt and throw
-        // it away instead.
-        //
-        // A failed hole punch is not a verdict, it is a coin toss that came up
-        // wrong: when one side is behind a router that assigns a port per
-        // destination, success depends on a check arriving while a binding
-        // happens to be open, and the next attempt is an independent try. The
-        // transport already knows this and rebuilds a peer the moment its
-        // connection dies — that is the join/leave churn the far end reports
-        // while this side is stuck.
-        //
-        // Which is exactly the problem. `checking` is not death, so this side
-        // never rebuilt, and the far end spent its retries throwing fresh
-        // attempts at a peer frozen on a stale one. They were never trying at
-        // the same time. Closing forfeits the attempt so both sides start over
-        // together.
-        this.#rebuilds.set(peerId, (this.#rebuilds.get(peerId) ?? 0) + 1)
-        const count = this.#rebuilds.get(peerId)
+        const count = (this.#rebuilds.get(peerId) ?? 0) + 1
+        this.#rebuilds.set(peerId, count)
 
         if (count > MAX_REBUILDS) {
           this.#note(peerId, 'gave-up',
-            `${count - 1} handshakes failed; this pair of networks needs a relay`)
+            `${count - 1} handshakes failed; this pair of networks may need a relay`)
           return
         }
 
@@ -862,15 +842,8 @@ export class Room extends Emitter {
           this.#note(peerId, 'rebuild-failed', err?.message ?? String(err))
         }
       }, STALL_MS)
-      this.#stalls.set(peerId, timer)
     }
     attempt(1)
-  }
-
-  #clearStall(peerId) {
-    const timer = this.#stalls.get(peerId)
-    if (timer) clearTimeout(timer)
-    this.#stalls.delete(peerId)
   }
 
   #restartIce(peerId, pc, why) {
