@@ -70,13 +70,11 @@ export class CallSession extends Emitter {
       this.#greeted.delete(peer.id)
       if (this.pinned === peer.id) this.pinned = null
 
-      // A peer that was mid-call and never reached a healthy state did not
-      // leave, it was lost — and saying "left" for both hides the failure that
-      // is worth knowing about. The other end may not even have noticed yet.
+      // A peer lost mid-call did not leave, and saying "left" for both hides
+      // the failure worth knowing about. The other end may not have noticed
+      // yet — the word is the only clue either person gets.
       const dropped = peer.net?.state === 'disconnected' || peer.net?.state === 'failed'
-      this.emit('notice', dropped
-        ? `${peer.nick || 'someone'} dropped — connection lost, not a goodbye`
-        : `${peer.nick || 'someone'} left`)
+      this.emit('notice', `${peer.nick || 'someone'} ${dropped ? 'dropped' : 'left'}`)
 
       this.#adaptQuality()
       this.emit('change')
