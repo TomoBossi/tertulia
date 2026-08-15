@@ -170,21 +170,39 @@ export class Room extends Emitter {
     this.#room.onPeerJoin = async (peerId) => {
       const peer = this.#ensure(peerId)
 
+      // Announced first, and before anything that can fail.
+      //
+      // Someone being in the room is a fact. Sending them our streams, capping
+      // an encoder and bounding a jitter buffer are all things we would like
+      // to do about that fact, and none of them are allowed a vote on whether
+      // it happened. When the announcement came last, any of those throwing
+      // left a peer that had genuinely connected sitting at "connecting"
+      // forever, with the application never told it had arrived — the failure
+      // presenting as the one thing it was not, a connection problem.
+      this.#note(peerId, 'join')
+      this.emit('peer:join', peer)
+
       // Someone arriving late has missed everything said so far, so both our
       // identity and our streams are repeated privately for them.
       this.#announce(peerId)
-      await this.#resendStreams(peerId)
 
       // Raw channels are per peer connection and must be created for each one.
       for (const raw of this.#rawChannels.values()) raw.attach(peerId)
 
-      // A new peer means new senders and receivers, which inherit neither the
-      // send cap nor the playout bound.
-      await this.#applyBitrate()
-      await this.#applyPlayoutDelay()
-
-      this.#note(peerId, 'join')
-      this.emit('peer:join', peer)
+      // Each step is independently survivable, so one failing does not cancel
+      // the rest. A new peer means new senders and receivers, which inherit
+      // neither the send cap nor the playout bound.
+      for (const [what, step] of [
+        ['resend-streams', () => this.#resendStreams(peerId)],
+        ['bitrate', () => this.#applyBitrate()],
+        ['playout', () => this.#applyPlayoutDelay()],
+      ]) {
+        try {
+          await step()
+        } catch (err) {
+          this.#note(peerId, `${what}-failed`, err?.message ?? String(err))
+        }
+      }
     }
 
     this.#room.onPeerLeave = (peerId) => {
@@ -507,7 +525,12 @@ export class Room extends Emitter {
    * behind another still writes current values.
    */
   #applyBitrate() {
-    const run = () => this.#applyBitrateOnce()
+    // The chain must never carry a rejection forward. A queue that poisons
+    // itself on one bad run would take every later caller down with it, and
+    // callers include the join handler.
+    const run = () => this.#applyBitrateOnce().catch((err) => {
+      this.#note('-', 'bitrate-failed', err?.message ?? String(err))
+    })
     this.#bitrateJob = this.#bitrateJob.then(run, run)
     return this.#bitrateJob
   }
