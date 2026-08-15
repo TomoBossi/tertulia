@@ -148,7 +148,15 @@ function throughput(stats, pc) {
 
   // The far end's opinion of what we send it, carried back in RTCP receiver
   // reports. Without this a sender is blind to its own outbound direction.
-  let remoteLost = null
+  //
+  // Counted, not sampled. Taking the worst fraction across streams reads a
+  // handful of lost packets on a low-volume stream — a muted microphone, a
+  // retransmission channel — as catastrophic loss on the call, and produces
+  // figures that swing between 8% and 94% within seconds while nothing
+  // changes. Totals differenced over the window give the rate that is
+  // actually being experienced.
+  let remotePacketsLost = 0
+  let packetsSent = 0
   let remoteJitter = null
 
   stats.forEach((report) => {
@@ -164,10 +172,9 @@ function throughput(stats, pc) {
       }
     } else if (report.type === 'outbound-rtp') {
       bytesOut += report.bytesSent ?? 0
+      packetsSent += report.packetsSent ?? 0
     } else if (report.type === 'remote-inbound-rtp') {
-      if (typeof report.fractionLost === 'number') {
-        remoteLost = Math.max(remoteLost ?? 0, report.fractionLost)
-      }
+      remotePacketsLost += report.packetsLost ?? 0
       if (typeof report.jitter === 'number') {
         remoteJitter = Math.max(remoteJitter ?? 0, report.jitter)
       }
@@ -178,14 +185,13 @@ function throughput(stats, pc) {
     // jitterBufferDelay is cumulative seconds across every frame emitted, so
     // dividing by the count gives the average hold time per frame.
     playoutDelay: jitterCount > 0 ? Math.round((jitterDelay / jitterCount) * 1000) : null,
-    remoteLoss: remoteLost == null ? null : Math.round(remoteLost * 1000) / 10,
     remoteJitter: remoteJitter == null ? null : Math.round(remoteJitter * 1000),
     freezeRatio: videoSeconds > 0 ? Math.round((freezeSeconds / videoSeconds) * 1000) / 10 : null,
   }
 
   const now = performance.now()
   const previous = pc.__plazaSample
-  pc.__plazaSample = { at: now, bytesIn, bytesOut }
+  pc.__plazaSample = { at: now, bytesIn, bytesOut, remotePacketsLost, packetsSent }
 
   if (!previous) return derived
 
@@ -193,8 +199,17 @@ function throughput(stats, pc) {
   if (seconds <= 0) return derived
 
   const total = packetsLost + packetsReceived
+
+  // Outbound loss over this window: what they missed, against what we sent.
+  const sentNow = packetsSent - (previous.packetsSent ?? 0)
+  const lostNow = remotePacketsLost - (previous.remotePacketsLost ?? 0)
+  const remoteLoss = sentNow > 0
+    ? Math.max(0, Math.round((lostNow / sentNow) * 1000) / 10)
+    : null
+
   return {
     ...derived,
+    remoteLoss,
     inboundKbps: Math.round(((bytesIn - previous.bytesIn) * 8) / seconds / 1000),
     outboundKbps: Math.round(((bytesOut - previous.bytesOut) * 8) / seconds / 1000),
     packetLoss: total > 0 ? Math.round((packetsLost / total) * 1000) / 10 : null,

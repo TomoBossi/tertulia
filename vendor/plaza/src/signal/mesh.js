@@ -109,6 +109,8 @@ export function joinRoom(
   const actions = new Map()    // name -> {onMessage}
   const published = new Map()  // stream -> metadata
   const pings = new Map()      // peerId -> [{resolve, reject}]
+  const streamMeta = new Map() // peerId -> Map(streamId -> metadata)
+  const pendingTracks = new Map() // peerId -> Map(streamId -> {stream, timer})
   const log = []
 
   let left = false
@@ -225,6 +227,36 @@ export function joinRoom(
     return link
   }
 
+  /**
+   * Surface an arriving stream, once it can be named.
+   *
+   * Metadata travels over the data channel and tracks arrive by
+   * renegotiation, so the label almost always lands first — but "almost
+   * always" is not a guarantee, and a stream surfaced with the wrong name is
+   * indistinguishable from one that never stops. A brief wait costs nothing
+   * and removes the race.
+   */
+  const announceStream = (peerId, stream) => {
+    const known = streamMeta.get(peerId)?.get(stream.id)
+    if (known !== undefined) {
+      listeners.onPeerStream?.(stream, peerId, known)
+      return
+    }
+
+    const waiting = pendingTracks.get(peerId) ?? new Map()
+    if (waiting.has(stream.id)) return
+
+    const timer = setTimeout(() => {
+      waiting.delete(stream.id)
+      // Give up waiting and surface it unlabelled rather than losing it.
+      note(peerId, 'stream-unlabelled', `${stream.id.slice(0, 8)} arrived with no metadata`)
+      listeners.onPeerStream?.(stream, peerId, undefined)
+    }, 2000)
+
+    waiting.set(stream.id, { stream, timer })
+    pendingTracks.set(peerId, waiting)
+  }
+
   const handleLinkEvent = (event, peerId, ...rest) => {
     if (event === 'open') {
       stopChasing(peerId)
@@ -234,7 +266,7 @@ export function joinRoom(
       if (link) {
         for (const [stream, metadata] of published) {
           link.addStream(stream)
-          link.send({ __plaza: 'stream-meta', metadata })
+          link.send({ __plaza: 'stream-meta', streamId: stream.id, metadata })
         }
       }
       listeners.onPeerJoin?.(peerId)
@@ -252,16 +284,17 @@ export function joinRoom(
       // Reject anything waiting on this peer rather than leaving it hanging.
       for (const waiter of pings.get(peerId) ?? []) waiter.reject(new Error(why))
       pings.delete(peerId)
+      for (const entry of pendingTracks.get(peerId)?.values() ?? []) clearTimeout(entry.timer)
+      pendingTracks.delete(peerId)
+      streamMeta.delete(peerId)
       note(peerId, 'gone', why)
       if (wasOpen) listeners.onPeerLeave?.(peerId, new Error(why))
       return
     }
 
     if (event === 'track') {
-      const [track, stream] = rest
-      const link = links.get(peerId)
-      const metadata = link?.__pendingMeta ?? undefined
-      listeners.onPeerStream?.(stream, peerId, metadata)
+      const [, stream] = rest
+      announceStream(peerId, stream)
       return
     }
 
@@ -286,10 +319,25 @@ export function joinRoom(
       return
     }
     if (data?.__plaza === 'stream-meta') {
-      // Metadata arrives beside the tracks, not inside them; hold it so the
-      // next ontrack can be labelled.
-      const link = links.get(peerId)
-      if (link) link.__pendingMeta = data.metadata
+      // Keyed by stream id, not held in a single slot. A peer sharing a
+      // camera and a screen sends two of these, and one slot means the second
+      // overwrites the first — the screen then arrives labelled as a camera,
+      // and the message that later says "the screen stopped" finds nothing
+      // under that name and leaves its last frame on the wall forever.
+      //
+      // Stream ids survive the trip: they travel in the SDP, so both sides
+      // agree on them.
+      const forPeer = streamMeta.get(peerId) ?? new Map()
+      forPeer.set(data.streamId, data.metadata)
+      streamMeta.set(peerId, forPeer)
+
+      // A track may already be waiting on this label.
+      const waiting = pendingTracks.get(peerId)?.get(data.streamId)
+      if (waiting) {
+        clearTimeout(waiting.timer)
+        pendingTracks.get(peerId).delete(data.streamId)
+        listeners.onPeerStream?.(waiting.stream, peerId, data.metadata)
+      }
       return
     }
     if (data?.__plaza === 'leaving') {
@@ -551,7 +599,7 @@ export function joinRoom(
       const targets = target ? [links.get(target)].filter(Boolean) : [...links.values()]
       for (const link of targets) {
         link.addStream(stream)
-        link.send({ __plaza: 'stream-meta', metadata })
+        link.send({ __plaza: 'stream-meta', streamId: stream.id, metadata })
       }
     },
 
