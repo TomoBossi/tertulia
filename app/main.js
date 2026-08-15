@@ -122,7 +122,8 @@ async function enterCall(code, nick) {
   stage.onPin = (id) => { session.pin(id); render() }
 
   float = new FloatChat($('#chat-float'))
-  float.system(`room ${code} · press ? for keys`)
+  // A phone has no key to press, so the hint is only advice on how to fail.
+  float.system(TOUCH ? `room ${code}` : `room ${code} · press ? for keys`)
 
   session.on('change', render)
   session.on('chat', (msg) => { float.append(msg); recordChat(msg) })
