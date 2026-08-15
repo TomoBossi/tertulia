@@ -3,6 +3,15 @@ import { Emitter } from './emitter.js'
 import { watchConnection } from './diagnostics.js'
 
 /**
+ * How long a handshake may sit in `checking` before it is assumed stuck.
+ *
+ * Long enough that a slow mobile path finishes on its own — a reflexive
+ * candidate pair over 4G can genuinely take several seconds to nominate — and
+ * short enough that a person has not yet given up and reloaded.
+ */
+const STALL_MS = 8000
+
+/**
  * A room: the people in it, what they are broadcasting about themselves, and
  * the channels anything else can talk over.
  *
@@ -59,6 +68,8 @@ export class Room extends Emitter {
   #playout = null
   #bitrateJob = Promise.resolve()
   #restarts = new Map()
+  #stalls = new Map()
+  #watched = new WeakSet()
   #strained = new Set()
 
   constructor(trysteroRoom, { presence = {} } = {}) {
@@ -189,6 +200,10 @@ export class Room extends Emitter {
       // Raw channels are per peer connection and must be created for each one.
       for (const raw of this.#rawChannels.values()) raw.attach(peerId)
 
+      // Watch the path from the first moment there is one to watch.
+      const pc = this.#room.getPeers()[peerId]
+      if (pc) this.#watchIce(peerId, pc)
+
       // Each step is independently survivable, so one failing does not cancel
       // the rest. A new peer means new senders and receivers, which inherit
       // neither the send cap nor the playout bound.
@@ -211,6 +226,7 @@ export class Room extends Emitter {
       this.peers.delete(peerId)
       this.#restarts.delete(peerId)
       this.#strained.delete(peerId)
+      this.#clearStall(peerId)
       for (const raw of this.#rawChannels.values()) raw.detach(peerId)
 
       this.#note(peerId, 'leave', `last seen ${peer.net.state}, path ${peer.net.path ?? '-'}`)
@@ -657,7 +673,10 @@ export class Room extends Emitter {
       if (changed) this.emit('peer:net', peer, net)
 
       this.#noteStrain(peerId, net)
-      this.#maybeRestart(peerId, pc, net)
+
+      // Safety net. The watcher is attached the moment a peer joins; this
+      // catches any connection that appeared by some other route.
+      this.#watchIce(peerId, pc)
     }
   }
 
@@ -702,19 +721,97 @@ export class Room extends Emitter {
    *
    * Once per episode: a restart storm would make a struggling link worse.
    */
-  #maybeRestart(peerId, pc, net) {
-    if (net.state !== 'disconnected') {
-      if (net.state === 'connected' || net.state === 'completed') {
-        this.#restarts.delete(peerId)
-      }
+  /**
+   * Watch one peer connection's ICE state directly.
+   *
+   * This used to be driven off the two-second stats poll, which is far too
+   * slow to matter. The transport underneath destroys a peer five seconds
+   * after it goes `disconnected`, and a restart on a mobile network needs most
+   * of that: regather a reflexive candidate through STUN, carry an offer and
+   * answer through the rendezvous, punch again. Spending the first one or two
+   * of those five seconds waiting for a poll tick is the difference between a
+   * recovery that lands and one that never gets the chance.
+   */
+  #watchIce(peerId, pc) {
+    if (this.#watched.has(pc)) return
+    this.#watched.add(pc)
+
+    // Guarded for the same reason the join steps are: recovery is a thing we
+    // would like to have, not a precondition for the peer being in the room.
+    try {
+      const onChange = () => this.#onIceState(peerId, pc)
+      pc.addEventListener('iceconnectionstatechange', onChange)
+      onChange()
+    } catch (err) {
+      this.#note(peerId, 'ice-watch-failed', err?.message ?? String(err))
+    }
+  }
+
+  #onIceState(peerId, pc) {
+    if (this.#left) return
+    const state = pc.iceConnectionState
+
+    if (state === 'connected' || state === 'completed') {
+      this.#restarts.delete(peerId)
+      this.#clearStall(peerId)
       return
     }
-    if (this.#restarts.has(peerId)) return
 
-    this.#restarts.set(peerId, Date.now())
+    if (state === 'disconnected' || state === 'failed') {
+      this.#clearStall(peerId)
+      if (this.#restarts.has(peerId)) return
+      this.#restarts.set(peerId, Date.now())
+
+      // Only one side may offer, or the two collide mid-renegotiation. The
+      // lower id goes at once; the other waits, purely as a backstop for the
+      // case where the first never noticed. One restart fixes the path in
+      // both directions, so the delay costs nothing when things work.
+      const delay = this.selfId < peerId ? 0 : 1200
+      setTimeout(() => {
+        if (this.#left) return
+        const now = pc.iceConnectionState
+        if (now === 'connected' || now === 'completed' || now === 'closed') return
+        this.#restartIce(peerId, pc, 'path went quiet; regathering')
+      }, delay)
+      return
+    }
+
+    // `checking` and `new` have no deadline anywhere: the transport does not
+    // count them as failure, so a handshake that never completes hangs
+    // indefinitely and shows as "connecting" forever. That is what a stale
+    // candidate looks like — a peer that gathered a reflexive address minutes
+    // ago, whose NAT binding has since expired, so the address everyone is
+    // punching at is dead. Regathering is the only way out, and unlike the
+    // disconnected case nothing is racing us, so it is worth several tries.
+    this.#armStall(peerId, pc)
+  }
+
+  #armStall(peerId, pc) {
+    if (this.#stalls.has(peerId)) return
+    const attempt = (n) => {
+      const timer = setTimeout(() => {
+        this.#stalls.delete(peerId)
+        if (this.#left) return
+        const state = pc.iceConnectionState
+        if (state !== 'checking' && state !== 'new') return
+        this.#restartIce(peerId, pc, `still ${state} after ${STALL_MS * n / 1000}s; regathering`)
+        if (n < 3) attempt(n + 1)
+      }, STALL_MS)
+      this.#stalls.set(peerId, timer)
+    }
+    attempt(1)
+  }
+
+  #clearStall(peerId) {
+    const timer = this.#stalls.get(peerId)
+    if (timer) clearTimeout(timer)
+    this.#stalls.delete(peerId)
+  }
+
+  #restartIce(peerId, pc, why) {
     try {
       pc.restartIce()
-      this.#note(peerId, 'ice-restart', 'path went quiet; regathering')
+      this.#note(peerId, 'ice-restart', why)
     } catch (err) {
       this.#note(peerId, 'ice-restart-failed', err.message)
     }
