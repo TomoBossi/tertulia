@@ -62,6 +62,22 @@ const OFFER_TTL_MS = 120000
 const MAX_PENDING_OFFERS = 12
 
 /**
+ * How long a connection may fail to open before the peer is freed.
+ *
+ * `NEVER_STARTED_MS` is short because the state it watches for is terminal
+ * rather than slow: ICE leaves `new` within milliseconds of both descriptions
+ * being applied, and a connection still sitting there has no candidate pair in
+ * existence to try. Waiting longer cannot help it and does harm, because the
+ * peer is blocked from being introduced again for the whole time.
+ *
+ * `OPENING_DEADLINE_MS` covers a connection that is genuinely checking. That
+ * one may legitimately take many seconds between distant networks, so it is
+ * given far more room, and still bounded so it cannot hold the peer forever.
+ */
+const NEVER_STARTED_MS = 6000
+const OPENING_DEADLINE_MS = 25000
+
+/**
  * This page's identity, one per load, matching the vendored transport's shape.
  *
  * Deliberately global: a page is one peer, and two rooms open at once are the
@@ -104,8 +120,9 @@ export const DEFAULT_RELAYS = [
  */
 export function joinRoom(
   {
-    appId, password, rtcConfig, relayUrls, makeRendezvous, selfId: idOverride,
+    appId, password, rtcConfig, relayUrls, makeRendezvous, makeSwarm, selfId: idOverride,
     chaseSchedule = CHASE_MS, rebuildAfter = REBUILD_AFTER_CHASES,
+    neverStartedMs = NEVER_STARTED_MS, openingDeadlineMs = OPENING_DEADLINE_MS,
     discovery = 'tracker', trackerUrls,
   } = {},
   roomId,
@@ -266,6 +283,47 @@ export function joinRoom(
 
     waiting.set(stream.id, { stream, timer })
     pendingTracks.set(peerId, waiting)
+  }
+
+  /**
+   * Give up on a connection that is not going to open, and free the peer.
+   *
+   * The relay path has `chase`, which rebuilds a link that never came up. The
+   * tracker path had nothing: a link was created when the tracker introduced
+   * us and then lived forever whatever it did. That is worse than it sounds,
+   * because `answerOffer` refuses an incoming offer while a link for that peer
+   * exists — so one dead connection did not merely fail, it permanently
+   * blocked the reverse direction, which is a fresh offer with a fresh
+   * candidate set and an independent chance of working. Whichever direction
+   * happened to be established first won the peer for good.
+   *
+   * The two deadlines are deliberately far apart, because they mean different
+   * things. A connection still in `new` has no candidate pair to try and never
+   * will: ICE starts checking within milliseconds of a description being
+   * applied, so `new` after a few seconds is not slowness, it is a connection
+   * with nothing on either side that the other can route to. One that reached
+   * `connecting` really is trying, and across continents it deserves patience.
+   */
+  const watchOpening = (peerId, link) => {
+    const abandon = (why) => {
+      if (left || link.dead || link.open) return
+      // Only if this is still the current link for that peer — it may have
+      // been replaced already, and killing its successor would be a new bug.
+      if (links.get(peerId) !== link) return
+      note(peerId, 'abandoned', why)
+      link.die(why)
+      if (links.get(peerId) === link) links.delete(peerId)
+    }
+
+    setTimeout(() => {
+      if (link.pc.connectionState !== 'new') return
+      abandon('never started — ICE had no pair to try; freeing the peer to be introduced again')
+    }, neverStartedMs)
+
+    setTimeout(
+      () => abandon(`still ${link.pc.connectionState} after ${openingDeadlineMs / 1000}s`),
+      openingDeadlineMs,
+    )
   }
 
   const handleLinkEvent = (event, peerId, ...rest) => {
@@ -532,6 +590,7 @@ export function joinRoom(
       emit: (event, ...args) => handleLinkEvent(event, ...args),
     })
     links.set(peerId, link)
+    watchOpening(peerId, link)
     note(peerId, 'answering', `offer ${offerId.slice(0, 6)} from the swarm`)
 
     try {
@@ -575,20 +634,11 @@ export function joinRoom(
         ? ` — shared: ${shared.join('+')}`
         : ' — NO SHARED ADDRESS FAMILY, this connection cannot succeed'))
 
-    void link.applyAnswer(sdp).then((applied) => {
-      if (!applied) return
-      // A connection with no pair to try never leaves `new`, and so never
-      // reports a state change at all — which reads as nothing happening
-      // rather than as a failure. Say it plainly instead.
-      setTimeout(() => {
-        const link2 = links.get(peerId)
-        if (!link2 || link2.dead || link2.open) return
-        if (link2.pc.connectionState === 'new') {
-          note(peerId, 'never-started',
-            'the answer applied but ICE found no pair to try — neither side offered a reachable address')
-        }
-      }, 5000)
-    })
+    // A connection with no pair to try never leaves `new`, so it never reports
+    // a state change at all and reads as nothing happening rather than as a
+    // failure. The watchdog is what turns that silence back into another try.
+    watchOpening(peerId, link)
+    void link.applyAnswer(sdp)
   }
 
   const ready = (async () => {
@@ -610,11 +660,14 @@ export function joinRoom(
     if (discovery === 'tracker') {
       // No relay topics and no announce loop: the swarm carries introductions
       // itself, and the offers are the announcement.
-      swarm = new TrackerSwarm(trackerUrls ?? DEFAULT_TRACKERS, {
+      const swarmOptions = {
         infoHash: await infoHashFor(`plaza/${appId}/${roomId}`),
         peerId: id.padEnd(20, '0').slice(0, 20),
         log: (what, detail) => note('-', what, detail),
-      })
+      }
+      swarm = makeSwarm
+        ? makeSwarm(swarmOptions)
+        : new TrackerSwarm(trackerUrls ?? DEFAULT_TRACKERS, swarmOptions)
       swarm.onOffersNeeded = makeOffers
       swarm.onOffer = answerOffer
       swarm.onAnswer = takeAnswer
