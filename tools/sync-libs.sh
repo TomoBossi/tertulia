@@ -27,6 +27,10 @@ for lib in plaza mirador; do
   [ -d "$src/vendor" ] && cp -R "$src/vendor" "$here/vendor/$lib/vendor"
 
   version=$(sed -n "s/.*VERSION = '\\([^']*\\)'.*/\\1/p" "$src/src/$lib.js" | head -1)
+  # A sha alone is a claim about committed code, and this copies the working
+  # tree. Saying so when they differ is the difference between a manifest and
+  # a guess.
   sha=$(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  [ -n "$(git -C "$src" status --porcelain 2>/dev/null)" ] && sha="$sha+dirty"
   echo "$lib $version $sha" >> "$here/vendor/VERSIONS"
 done
