@@ -135,7 +135,7 @@ function modeLine() {
   // demonstrably ran a stale cached build while a newer one was live, and
   // nothing in the log said so — every conclusion drawn from it was about the
   // wrong code. A log that does not say what produced it is a trap.
-  return `settings: discovery ${opts.discovery ?? 'relay'}`
+  return `settings: discovery ${opts.discovery ?? 'tracker'}`
     + `, recovery ${opts.recover === false ? 'OFF' : 'on'}`
     + `, relay ${relay ? String(relay.urls) : 'none'}`
     + `, page built ${document.lastModified}`
@@ -144,20 +144,31 @@ function modeLine() {
 function connectionOptions() {
   const params = new URLSearchParams(location.search)
 
-  for (const key of ['turn', 'turnUser', 'turnPass', 'ice', 'signal', 'discovery']) {
+  for (const key of ['turn', 'turnUser', 'turnPass', 'ice', 'discovery']) {
     const value = params.get(key)
     if (value !== null) localStorage.setItem(`tertulia:${key}`, value)
   }
+  // ?reset=1 clears everything remembered. Settings persist so a phone only
+  // has to be told once, but that means a URL with no parameters can still be
+  // running a mode set days ago, with nothing on screen to say so.
+  if (params.get('reset') !== null) {
+    for (const key of ['turn', 'turnUser', 'turnPass', 'ice', 'discovery']) {
+      localStorage.removeItem(`tertulia:${key}`)
+    }
+  }
+
   const setting = (key) => localStorage.getItem(`tertulia:${key}`) || ''
 
   const options = {}
   if (setting('ice') === 'off') options.recover = false
 
-  // ?discovery=tracker finds peers through BitTorrent trackers instead of
-  // relays. A tracker introduces peers itself rather than carrying messages
-  // we build matchmaking on top of, and it cannot trickle candidates — so an
-  // offer carries every address it will ever have.
-  if (setting('discovery') === 'tracker') options.discovery = 'tracker'
+  // Peers are found through BitTorrent trackers unless asked otherwise. A
+  // tracker introduces peers itself rather than being a message bus that
+  // matchmaking is built on top of, and it carries a complete offer, so
+  // nothing can arrive after the description it belongs to. `?discovery=relay`
+  // selects Nostr relays, which fail independently — that is the point of
+  // having both.
+  if (setting('discovery') === 'relay') options.discovery = 'relay'
 
   const turn = setting('turn')
   if (turn) {
@@ -527,13 +538,15 @@ function showDiag() {
 }
 
 function showInvite() {
-  // The mode travels with the invite. Without it a scanned QR silently puts
-  // the two devices on different signalling systems, where neither can ever
-  // see the other and nothing anywhere says why. Credentials are deliberately
+  // The mode travels with the invite, but only when it is not the default.
+  // Without it a scanned QR silently puts the two devices on different
+  // signalling systems, where neither can ever see the other and nothing
+  // anywhere says why — and carrying it when it changes nothing produces a
+  // link that looks configured when it is not. Credentials are deliberately
   // absent: an invite gets forwarded and screenshotted.
+  const discovery = localStorage.getItem('tertulia:discovery')
   const link = inviteUrl(roomCode, undefined, {
-    signal: localStorage.getItem('tertulia:signal') || undefined,
-    discovery: localStorage.getItem('tertulia:discovery') || undefined,
+    discovery: discovery === 'relay' ? 'relay' : undefined,
   })
   const matrix = qr(link)
 

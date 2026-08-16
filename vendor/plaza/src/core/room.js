@@ -78,6 +78,8 @@ export class Room extends Emitter {
 
   #room
   #channels = new Map()
+  #requests = new Map()
+  #nextRequest = 0
   #rawChannels = new Map()
   #published = new Map()
   #netTimer = null
@@ -290,6 +292,14 @@ export class Room extends Emitter {
       this.peers.delete(peerId)
       this.#strained.delete(peerId)
       for (const raw of this.#rawChannels.values()) raw.detach(peerId)
+      // Anything waiting on this peer will never be answered.
+      for (const channel of this.#requests.values()) {
+        for (const [id, waiting] of channel.pending) {
+          clearTimeout(waiting.timer)
+          channel.pending.delete(id)
+          waiting.reject(new Error('plaza: peer left before answering'))
+        }
+      }
 
       this.#note(peerId, 'leave',
         `${why} — last seen ${peer.net.state}, path ${peer.net.path ?? '-'}, now ${live}`)
@@ -510,6 +520,88 @@ export class Room extends Emitter {
     }
 
     this.#channels.set(key, channel)
+    return channel
+  }
+
+  /**
+   * Ask one peer a question and wait for its answer.
+   *
+   * Channels are one-way announcements, which is the wrong shape for the
+   * commonest thing a newcomer needs to do: ask somebody already here for the
+   * state they missed. A drawing wants the strokes so far, a game wants the
+   * board, a chat wants the backlog. Building that on a channel means
+   * inventing correlation ids and timeouts in every application that needs
+   * it, and getting the timeout wrong means a peer that vanished mid-answer
+   * hangs the newcomer forever.
+   *
+   * Each call carries its own id so answers cannot be confused with one
+   * another, and a peer that goes away is a rejection rather than a wait
+   * without end.
+   */
+  request(name, data, { target, timeout = 8000 } = {}) {
+    if (!target) return Promise.reject(new Error('plaza: a request needs a target'))
+    const channel = this.#requestChannel(name)
+
+    return new Promise((resolve, reject) => {
+      const id = `${this.selfId.slice(0, 6)}-${Date.now().toString(36)}-${this.#nextRequest++}`
+      const timer = setTimeout(() => {
+        channel.pending.delete(id)
+        reject(new Error(`plaza: ${name} request timed out`))
+      }, timeout)
+
+      channel.pending.set(id, { resolve, reject, timer })
+      channel.action.send({ ask: id, data }, { target }).catch((err) => {
+        clearTimeout(timer)
+        channel.pending.delete(id)
+        reject(err)
+      })
+    })
+  }
+
+  /**
+   * Answer requests on a name. The handler's return value is the answer.
+   *
+   * A handler that throws answers with nothing rather than leaving the asker
+   * waiting: one peer's broken state should not hang another's join.
+   */
+  answer(name, handler) {
+    this.#requestChannel(name).handler = handler
+  }
+
+  #requestChannel(name) {
+    const key = String(name)
+    const existing = this.#requests.get(key)
+    if (existing) return existing
+
+    const channel = {
+      pending: new Map(),
+      handler: null,
+      action: this.#room.makeAction(shortName(`rq.${key}`)),
+    }
+
+    channel.action.onMessage = async (msg, { peerId }) => {
+      if (msg?.ask) {
+        if (!channel.handler) return
+        let answer = null
+        try {
+          answer = await channel.handler(msg.data, peerId)
+        } catch {
+          // Answering with nothing beats leaving them waiting.
+        }
+        channel.action.send({ reply: msg.ask, data: answer }, { target: peerId }).catch(() => {})
+        return
+      }
+
+      if (msg?.reply) {
+        const waiting = channel.pending.get(msg.reply)
+        if (!waiting) return
+        clearTimeout(waiting.timer)
+        channel.pending.delete(msg.reply)
+        waiting.resolve(msg.data)
+      }
+    }
+
+    this.#requests.set(key, channel)
     return channel
   }
 

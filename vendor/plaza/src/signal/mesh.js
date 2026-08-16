@@ -91,11 +91,21 @@ export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
 ]
 
+/**
+ * Join a room.
+ *
+ * `discovery` selects how peers find each other, and defaults to trackers.
+ * A tracker introduces peers itself and carries a complete offer, so nothing
+ * can arrive after the description it belongs to; relays are a general message
+ * bus that matchmaking is built on top of, and are the fallback when a swarm
+ * cannot be reached. The two fail independently, which is the point of having
+ * both.
+ */
 export function joinRoom(
   {
     appId, password, rtcConfig, relayUrls, makeRendezvous, selfId: idOverride,
     chaseSchedule = CHASE_MS, rebuildAfter = REBUILD_AFTER_CHASES,
-    discovery = 'relay', trackerUrls,
+    discovery = 'tracker', trackerUrls,
   } = {},
   roomId,
 ) {

@@ -1,25 +1,26 @@
 # Vendored code
 
+Two libraries, both here because the browser does not provide what they do and
+reimplementing either would be a bad trade.
+
 ## secp256k1.mjs — @noble/secp256k1 v3.1.0
 
-BIP-340 Schnorr signing, which Nostr requires and browsers do not provide. It
-is here because reimplementing a signature scheme to avoid a dependency is a
-bad trade at any size — 11KB of audited code against the cost of getting
-elliptic curve arithmetic subtly wrong, where the failure mode is signatures
-that every relay silently rejects.
+BIP-340 Schnorr signing, required to publish Nostr events. Getting elliptic
+curve arithmetic subtly wrong produces signatures that every relay rejects
+silently, which is indistinguishable from a network that is not delivering.
 
-Nothing else is vendored. The transport that used to live here — trystero,
-58KB minified, carrying four hand-applied patches against code nobody could
-read — was replaced by `src/signal/`. Those patches were: an illegal rollback
-on offer glare, a failed ICE candidate being treated as fatal, a dropped peer
-never saying why, and a subscription window that made any peer with a slow
-clock invisible. Each had to be reapplied by hand on every re-vendor, against
-minified identifiers that change between builds. That maintenance is gone
-along with the bundle.
-
-To update: fetch the ESM build and check the primitive still behaves.
+To update:
 
     curl -sL https://cdn.jsdelivr.net/npm/@noble/secp256k1@3.1.0/+esm -o vendor/secp256k1.mjs
 
-A BIP-340 public key is 32 bytes and a signature is 64. Anything else means
-the wrong scheme, and the symptom is a network that appears not to deliver.
+Check afterwards that a public key is 32 bytes and a signature is 64. Anything
+else means the wrong scheme.
+
+## qrcode-generator.mjs
+
+QR encoding, for turning an invite into something a phone can scan. Requires
+Reed-Solomon coding over GF(256), mask selection and format-information bits,
+whose failure mode is a code that scans on one phone and not another.
+
+Only the encoder is vendored; `src/core/invite.js` turns its output into an SVG
+path, so nothing here touches the DOM.
