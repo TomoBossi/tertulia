@@ -412,6 +412,7 @@ export function joinRoom(
   // ------------------------------------------------------------- trackers
 
   const offered = new Map() // offerId -> Link awaiting an answer
+  let offerJob = Promise.resolve()
   let swarm = null
 
   /**
@@ -430,7 +431,26 @@ export function joinRoom(
    * They now expire on their own clock, comfortably longer than any tracker
    * takes to make an introduction.
    */
-  const makeOffers = async (n) => {
+  /**
+   * Build offers, one caller at a time.
+   *
+   * Every tracker socket announces as it opens, and they open together — so
+   * without this, three callers read an empty pool, each decide they need a
+   * full batch, and three batches get built. A field log caught exactly that:
+   * nine connections where three were wanted, and a peer answering two of
+   * them, the second of which had to be thrown away as a duplicate.
+   *
+   * Read-modify-write across an await is the same hazard the send-rate cap
+   * had. Serialising is the whole fix; a queued caller re-reads and finds the
+   * pool already full.
+   */
+  const makeOffers = (n) => {
+    const run = () => makeOffersOnce(n)
+    offerJob = offerJob.then(run, run)
+    return offerJob
+  }
+
+  const makeOffersOnce = async (n) => {
     if (left) return []
 
     const now = Date.now()
@@ -469,6 +489,20 @@ export function joinRoom(
       try {
         const sdp = await link.completeOffer()
         if (!sdp) { link.die('no offer produced'); continue }
+
+        // An offer with no reflexive candidate cannot cross the internet: it
+        // advertises only addresses inside the sender's own network. That
+        // failure is silent — the offer is answered, and then nothing happens,
+        // because there is no pair for ICE to try. Counting them here is the
+        // difference between seeing that and guessing at it.
+        const host = (sdp.match(/typ host/g) ?? []).length
+        const srflx = (sdp.match(/typ srflx/g) ?? []).length
+        const relay = (sdp.match(/typ relay/g) ?? []).length
+        note(offerId, 'offer-built',
+          srflx || relay
+            ? `${host} host, ${srflx} reflexive, ${relay} relayed`
+            : `${host} host and NOTHING REACHABLE — STUN did not answer`)
+
         offered.set(offerId, { link, at: Date.now(), sdp })
         made.push({ offerId, sdp })
       } catch (err) {
@@ -534,8 +568,26 @@ export function joinRoom(
 
     link.identify(peerId)
     links.set(peerId, link)
-    note(peerId, 'answered', `our offer ${offerId.slice(0, 6)}`)
-    void link.applyAnswer(sdp)
+
+    const answerSrflx = (sdp.match(/typ srflx/g) ?? []).length
+    const answerRelay = (sdp.match(/typ relay/g) ?? []).length
+    note(peerId, 'answered',
+      `our offer ${offerId.slice(0, 6)}; they offered ${answerSrflx} reflexive, ${answerRelay} relayed`)
+
+    void link.applyAnswer(sdp).then((applied) => {
+      if (!applied) return
+      // A connection with no pair to try never leaves `new`, and so never
+      // reports a state change at all — which reads as nothing happening
+      // rather than as a failure. Say it plainly instead.
+      setTimeout(() => {
+        const link2 = links.get(peerId)
+        if (!link2 || link2.dead || link2.open) return
+        if (link2.pc.connectionState === 'new') {
+          note(peerId, 'never-started',
+            'the answer applied but ICE found no pair to try — neither side offered a reachable address')
+        }
+      }, 5000)
+    })
   }
 
   const ready = (async () => {
