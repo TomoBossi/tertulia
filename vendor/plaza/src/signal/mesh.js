@@ -27,6 +27,7 @@ import { Rendezvous, topicOf } from './rendezvous.js'
 import { TrackerSwarm, infoHashFor, DEFAULT_TRACKERS } from './tracker.js'
 import { roomKey, seal, open } from './secret.js'
 import { Link } from './link.js'
+import { describe, summarize } from './candidates.js'
 
 const ANNOUNCE_MS = 4000
 const ANNOUNCE_WARMUP_MS = [200, 600, 1500]
@@ -490,18 +491,12 @@ export function joinRoom(
         const sdp = await link.completeOffer()
         if (!sdp) { link.die('no offer produced'); continue }
 
-        // An offer with no reflexive candidate cannot cross the internet: it
-        // advertises only addresses inside the sender's own network. That
-        // failure is silent — the offer is answered, and then nothing happens,
-        // because there is no pair for ICE to try. Counting them here is the
-        // difference between seeing that and guessing at it.
-        const host = (sdp.match(/typ host/g) ?? []).length
-        const srflx = (sdp.match(/typ srflx/g) ?? []).length
-        const relay = (sdp.match(/typ relay/g) ?? []).length
-        note(offerId, 'offer-built',
-          srflx || relay
-            ? `${host} host, ${srflx} reflexive, ${relay} relayed`
-            : `${host} host and NOTHING REACHABLE — STUN did not answer`)
+        // An offer advertising nothing the outside world can route is answered
+        // normally and then simply never connects, because there is no pair
+        // for ICE to try. That is silent unless it is counted here — and the
+        // address family matters as much as the count, since two peers with no
+        // family in common fail exactly the same way while both look healthy.
+        note(offerId, 'offer-built', describe(sdp))
 
         offered.set(offerId, { link, at: Date.now(), sdp })
         made.push({ offerId, sdp })
@@ -569,10 +564,16 @@ export function joinRoom(
     link.identify(peerId)
     links.set(peerId, link)
 
-    const answerSrflx = (sdp.match(/typ srflx/g) ?? []).length
-    const answerRelay = (sdp.match(/typ relay/g) ?? []).length
+    // Their half of the same question. Reported together with ours below, so
+    // a missing overlap reads as one fact rather than two logs to compare.
+    const theirs = summarize(sdp)
+    const ours = summarize(entry.sdp)
+    const shared = [ours.ip4 && theirs.ip4 && 'IPv4', ours.ip6 && theirs.ip6 && 'IPv6'].filter(Boolean)
     note(peerId, 'answered',
-      `our offer ${offerId.slice(0, 6)}; they offered ${answerSrflx} reflexive, ${answerRelay} relayed`)
+      `our offer ${offerId.slice(0, 6)}; they offered ${describe(sdp)}` +
+      (shared.length
+        ? ` — shared: ${shared.join('+')}`
+        : ' — NO SHARED ADDRESS FAMILY, this connection cannot succeed'))
 
     void link.applyAnswer(sdp).then((applied) => {
       if (!applied) return

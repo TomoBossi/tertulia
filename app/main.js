@@ -510,14 +510,12 @@ function showDiag() {
   ] }).then((nat) => {
     const el = $('#diag-nat')
     if (!el) return
-    const verdict = {
-      'endpoint-independent': 'direct connections work',
-      'address-dependent': 'DIRECT CONNECTIONS IMPOSSIBLE — needs a relay',
-      inconclusive: 'could not tell',
-      unknown: 'could not tell',
-    }[nat.mapping]
-    natLine = `this network: ${nat.mapping} — ${verdict}` +
-      (nat.candidates.length ? ` [${nat.candidates.join(' ')}]` : '')
+    // The detail is now the informative half — it names the address families,
+    // which is what decides whether a given peer is reachable — so it is shown
+    // rather than replaced by a fixed phrase per verdict.
+    natLine = `this network: ${nat.mapping} — ${nat.detail}` +
+      (nat.candidates.length ? ` [${nat.candidates.join(' ')}]` : '') +
+      (nat.globalV6 ? ` [v6 ${nat.globalV6}]` : '')
     el.textContent = natLine
   })
 

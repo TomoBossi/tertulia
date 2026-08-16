@@ -10,6 +10,7 @@
  *
  * This module extracts the handful that matter.
  */
+import { classify } from '../signal/candidates.js'
 
 /**
  * The connection's state, read from the field that tells the truth.
@@ -329,12 +330,19 @@ export async function probeNat({ iceServers, timeout = 6000 } = {}) {
 
     const srflx = []
     const hostPorts = new Set()
+    let globalV6 = null
+    let hiddenHosts = 0
 
     const done = new Promise((resolve) => {
       const finish = () => resolve()
       pc.onicecandidate = ({ candidate }) => {
         if (!candidate) return finish() // gathering complete
-        if (candidate.type === 'host') hostPorts.add(candidate.port)
+        if (candidate.type === 'host') {
+          hostPorts.add(candidate.port)
+          const { family, global, why } = classify(candidate.address)
+          if (why === 'hidden by mDNS') hiddenHosts++
+          if (global && family === 6 && !globalV6) globalV6 = candidate.address
+        }
         if (candidate.type === 'srflx') srflx.push({ address: candidate.address, port: candidate.port })
       }
       setTimeout(finish, timeout)
@@ -345,9 +353,26 @@ export async function probeNat({ iceServers, timeout = 6000 } = {}) {
 
     const mappings = new Set(srflx.map((c) => `${c.address}:${c.port}`))
     result.candidates = [...mappings]
+    result.ip6 = Boolean(globalV6)
+    result.ip4 = mappings.size > 0
+    if (globalV6) result.globalV6 = globalV6
 
     if (mappings.size === 0) {
-      result.detail = 'no reflexive candidate was gathered; STUN did not answer'
+      // The subtlety that made the previous version of this wrong: on a native
+      // IPv6 network there is no NAT to discover, so the reflexive candidate
+      // is identical to the host candidate and the browser discards it as
+      // redundant. Zero reflexive candidates there means perfect connectivity,
+      // not a missing STUN reply — the opposite of what it used to report.
+      if (globalV6) {
+        result.mapping = 'ipv6-direct'
+        result.detail = 'no NAT — a public IPv6 address, reachable directly. '
+          + 'No IPv4 route out, so peers without IPv6 cannot be reached at all'
+        return result
+      }
+      result.detail = hiddenHosts
+        ? 'no public address of either family; local addresses hidden by mDNS '
+          + '(grant camera access and retry for a definite answer)'
+        : 'no public address of either family — nothing here can be reached from outside'
       return result
     }
 
@@ -368,13 +393,20 @@ export async function probeNat({ iceServers, timeout = 6000 } = {}) {
     // this does not group by it.
     const sockets = Math.max(1, hostPorts.size)
 
+    // Whether this machine has IPv6 is worth stating even when IPv4 works,
+    // because it is the half of the answer that decides whether an IPv6-only
+    // peer — which is most phones on most mobile networks now — is reachable
+    // at all. Without it such a call fails with every IPv4 sign healthy.
+    const v6 = globalV6 ? 'IPv4 and IPv6' : 'IPv4 only, no IPv6'
+
     if (mappings.size > sockets) {
       result.mapping = 'address-dependent'
       result.detail = `${mappings.size} external addresses for ${sockets} local socket`
-        + `${sockets === 1 ? '' : 's'} — a different port per destination, so direct connections cannot be made`
+        + `${sockets === 1 ? '' : 's'} — a different port per destination, `
+        + `so direct connections cannot be made (${v6})`
     } else {
       result.mapping = 'endpoint-independent'
-      result.detail = 'every STUN server saw the same address — direct connections work'
+      result.detail = `every STUN server saw the same address — direct connections work (${v6})`
     }
     return result
   } catch (err) {
