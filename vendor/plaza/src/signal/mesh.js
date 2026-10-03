@@ -54,6 +54,9 @@ const ANNOUNCE_MS = 4000
 const ANNOUNCE_WARMUP_MS = [200, 600, 1500]
 const PING_TIMEOUT_MS = 5000
 
+/** How long a connection that looks open may take to answer a liveness ping. */
+const LIVENESS_MS = 1500
+
 /**
  * How hard to chase a peer we know exists but have not connected to.
  *
@@ -168,6 +171,7 @@ export function joinRoom(
   const actions = new Map()    // name -> {onMessage}
   const published = new Map()  // stream -> metadata
   const pings = new Map()      // peerId -> [{resolve, reject}]
+  const probes = new Map()     // ping id -> resolve, for liveness checks
   const streamMeta = new Map() // peerId -> Map(streamId -> metadata)
   const pendingTracks = new Map() // peerId -> Map(streamId -> {stream, timer})
   const log = []
@@ -581,6 +585,8 @@ export function joinRoom(
       return
     }
     if (data?.__plaza === 'pong') {
+      const probe = probes.get(data.id)
+      if (probe) { probes.delete(data.id); probe(); return }
       const waiter = pings.get(peerId)?.shift()
       waiter?.resolve()
       return
@@ -838,10 +844,35 @@ export function joinRoom(
     return publishing
   }
 
+  /**
+   * Is a connection that looks open actually being heard from? A ping over it,
+   * matched by id, answered within the deadline or not.
+   */
+  const alive = (link, ms = LIVENESS_MS) => new Promise((resolve) => {
+    const probeId = randomId()
+    const timer = setTimeout(() => { probes.delete(probeId); resolve(false) }, ms)
+    probes.set(probeId, () => { clearTimeout(timer); resolve(true) })
+    if (!link.send({ __plaza: 'ping', id: probeId })) { clearTimeout(timer); probes.delete(probeId); resolve(false) }
+  })
+
   const answerOffer = async ({ peerId, offerId, sdp }) => {
     if (left) return null
     const existing = links.get(peerId)
     let racing = false
+
+    // An offer from someone we believe we are connected to. Usually that is
+    // their routine announce and the connection is fine. But when they have
+    // given up on it — we were frozen, or offline, and they noticed first —
+    // our side still looks open until its own timeouts run out, and every
+    // offer they make to get us back was refused as "already connected".
+    // Measured on a phone thawed after forty seconds: fourteen of the
+    // twenty-four seconds back were spent exactly so. A ping settles it.
+    if (existing?.open && !existing.dead && !(await alive(existing))) {
+      note(peerId, 'stale', 'they offered again and our connection did not answer; letting it go')
+      existing.die('stale: the other side had given up on it')
+    }
+    const current = links.get(peerId)
+    if (current !== existing) return answerOffer({ peerId, offerId, sdp })
     if (existing && !existing.dead) {
       // A working connection is never traded for a hypothetical one, and
       // there is at most one connection in each direction. Otherwise theirs

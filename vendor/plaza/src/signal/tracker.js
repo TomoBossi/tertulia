@@ -28,9 +28,17 @@
  */
 
 const RECONNECT_MS = 4000
+const URGENT_RETRY_MS = 1000
 const MAX_BACKOFF_MS = 60000
 const ANNOUNCE_MS = 20000
-const OFFERS_PER_ANNOUNCE = 3
+/**
+ * How many offers an announce carries, and so how many peers it can reach:
+ * a tracker hands each offer to a different peer. Three meant a newcomer to a
+ * room of four met only three of them until the next routine announce,
+ * twenty seconds on. Six covers a room of that size and more in one round
+ * while keeping an announce well under what trackers accept.
+ */
+const OFFERS_PER_ANNOUNCE = 6
 
 /** Trackers that answered a full offer/answer round trip when last measured. */
 export const DEFAULT_TRACKERS = [
@@ -135,7 +143,10 @@ export class TrackerSwarm {
     if (this.#closed || this.#retryTimers.has(url)) return
     const attempt = this.#attempts.get(url) ?? 0
     this.#attempts.set(url, attempt + 1)
-    const delay = this.urgent ? RECONNECT_MS : Math.min(RECONNECT_MS * 2 ** attempt, MAX_BACKOFF_MS)
+    // While someone is missing, a tracker is retried every second: the
+    // network coming back is exactly when it is needed, and the first attempt
+    // after an outage often fires a moment before the network is usable.
+    const delay = this.urgent ? URGENT_RETRY_MS : Math.min(RECONNECT_MS * 2 ** attempt, MAX_BACKOFF_MS)
     this.#log('tracker-retry', `${url} (${why}) in ${delay}ms`)
     this.#retryTimers.set(url, setTimeout(() => {
       this.#retryTimers.delete(url)
