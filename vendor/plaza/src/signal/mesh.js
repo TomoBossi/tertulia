@@ -359,6 +359,7 @@ export function joinRoom(
   }
 
   const sought = new Set() // peerIds dropped and not yet back
+  let lastKick = 0
   let seekTimer = null
   let seekRound = 0
 
@@ -486,10 +487,14 @@ export function joinRoom(
       // must not be reported as one.
       if (why === 'rebuilding after failed discovery') return
       links.delete(peerId)
-      // An attempt to reach someone we are looking for just failed. The next
-      // one should not wait for the schedule.
-      if (!wasOpen && sought.has(peerId) && swarm && !left) {
-        note(peerId, 'seeking', `attempt failed (${why}); announcing again now`)
+      // An attempt to reach somebody we were introduced to just failed. The
+      // next one should not wait twenty seconds for the routine announce —
+      // whether they had been connected or this was the first try, as when a
+      // tracker loses the answer to our very first introduction. Limited to
+      // one a second, so a burst of failures is not a burst of announces.
+      if (!wasOpen && swarm && !left && Date.now() - lastKick > 1000) {
+        lastKick = Date.now()
+        note(peerId, 'retrying', `attempt failed (${why}); announcing again now`)
         void swarm.announce()
       }
       // Reject anything waiting on this peer rather than leaving it hanging.
