@@ -190,15 +190,58 @@ export function joinRoom(
    *
    * An open data channel beats any rendezvous: it is direct, ordered, and
    * needs no third party. The rendezvous is only for reaching someone we
-   * cannot yet talk to — which, once connected, is nobody.
+   * cannot yet talk to.
+   *
+   * Except that the channel rides the very path a repair is trying to
+   * replace. Once a connection has opened, everything that renegotiates it —
+   * a restart's offer and answer, its new candidates, a request to restart —
+   * travels over its own channel, so a path that has died takes its repair
+   * down with it, and a tracker offers no other way to reach that one peer.
+   * But in a room of three or more, someone else is usually still connected
+   * to both. So while the direct path is not connected, signals also go to
+   * every other connected peer, which forward them; whichever copy arrives
+   * first is used and the rest are recognised and dropped.
    */
   const signalTo = (peerId, msg) => {
     const link = links.get(peerId)
-    if (link?.open) {
-      link.send({ __plaza: 'signal', msg })
+    const sid = `${id}:${++signalSeq}`
+    if (connected(link)) {
+      link.send({ __plaza: 'signal', sid, msg })
       return
     }
-    void sendTo(peerId, msg)
+
+    let relays = 0
+    if (link?.opened) {
+      for (const [other, via] of links) {
+        if (other === peerId || !connected(via)) continue
+        via.send({ __plaza: 'relay', to: peerId, sid, msg })
+        relays++
+      }
+      if (relays && Date.now() - lastRelayNote > 2000) {
+        lastRelayNote = Date.now()
+        note(peerId, 'relaying', `direct path ${link.pc.connectionState}; signalling through ${relays} other peer(s)`)
+      }
+    }
+    // A path that is only half broken may still deliver, so the channel is
+    // tried as well; the duplicate costs nothing.
+    if (link?.open) link.send({ __plaza: 'signal', sid, msg })
+    else if (!relays) void sendTo(peerId, msg)
+  }
+
+  /** A channel that is open over a path that is working right now. */
+  const connected = (link) => !!link?.open && link.pc.connectionState === 'connected'
+
+  let signalSeq = 0
+  let lastRelayNote = 0
+  const seenSignals = new Set()
+
+  /** Whether a signal is the first copy to arrive. Old peers send no id. */
+  const firstCopy = (sid) => {
+    if (!sid) return true
+    if (seenSignals.has(sid)) return false
+    seenSignals.add(sid)
+    if (seenSignals.size > 500) seenSignals.delete(seenSignals.values().next().value)
+    return true
   }
 
   const sendTo = async (peerId, msg) => {
@@ -539,7 +582,25 @@ export function joinRoom(
       return
     }
     if (data?.__plaza === 'signal') {
-      void links.get(peerId)?.accept(data.msg)
+      if (firstCopy(data.sid)) void links.get(peerId)?.accept(data.msg)
+      return
+    }
+    if (data?.__plaza === 'relay') {
+      // Somebody whose path to `to` is down, asking us to pass a signal on.
+      // Only over a path that works: relaying into a broken one helps nobody.
+      const onward = links.get(data.to)
+      if (typeof data.to === 'string' && connected(onward)) {
+        onward.send({ __plaza: 'relayed', from: peerId, sid: data.sid, msg: data.msg })
+      }
+      return
+    }
+    if (data?.__plaza === 'relayed') {
+      // A signal from `from`, carried by the peer it arrived from. The room
+      // is the trust boundary here as everywhere: anyone in it could already
+      // say anything over their own channel.
+      if (typeof data.from === 'string' && firstCopy(data.sid)) {
+        void links.get(data.from)?.accept(data.msg)
+      }
       return
     }
     if (data?.__plaza === 'stream-meta') {
