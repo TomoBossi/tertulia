@@ -86,6 +86,9 @@ const REBUILD_AFTER_CHASES = 5
 const OFFER_TTL_MS = 120000
 const MAX_PENDING_OFFERS = 12
 
+/** How many times an offer goes out before new ones are minted beside it. */
+const STALE_AFTER_PUBLISHES = 3
+
 /**
  * How long a connection may fail to open before the peer is freed.
  *
@@ -233,6 +236,7 @@ export function joinRoom(
 
   let signalSeq = 0
   let lastRelayNote = 0
+  let lastRelayedNote = 0
   const seenSignals = new Set()
 
   /** Whether a signal is the first copy to arrive. Old peers send no id. */
@@ -599,6 +603,10 @@ export function joinRoom(
       // is the trust boundary here as everywhere: anyone in it could already
       // say anything over their own channel.
       if (typeof data.from === 'string' && firstCopy(data.sid)) {
+        if (Date.now() - lastRelayedNote > 2000) {
+          lastRelayedNote = Date.now()
+          note(data.from, 'relayed-in', `${data.msg?.type ?? 'signal'} carried by ${peerId.slice(0, 6)}`)
+        }
         void links.get(data.from)?.accept(data.msg)
       }
       return
@@ -687,6 +695,7 @@ export function joinRoom(
   // ------------------------------------------------------------- trackers
 
   const offered = new Map() // offerId -> Link awaiting an answer
+  let leadSeq = 0
   let offerJob = Promise.resolve()
   let swarm = null
 
@@ -751,12 +760,22 @@ export function joinRoom(
     // offer every time until it expired, two minutes later. Rotating means
     // each announce carries one they have not seen.
     const reusable = [...offered.entries()]
-      .sort(([, a], [, b]) => a.published - b.published)
+      .sort(([, a], [, b]) => a.published - b.published || (a.ledAt ?? 0) - (b.ledAt ?? 0))
       .map(([offerId, entry]) => ({ offerId, sdp: entry.sdp, entry }))
-    const wanted = Math.max(0, Math.min(n, MAX_PENDING_OFFERS - reusable.length))
+    // Only as many new ones as there are too few fresh ones. Every tracker
+    // announces as its socket opens, and they open together; minting a full
+    // batch for each, one after another, kept the second tracker waiting
+    // twelve seconds for offers the first already had and the third
+    // twenty-four — measured between a laptop and a phone. The same offer
+    // can go out through every tracker. Offers that have been handed out
+    // several times are replaced rather than relied on, since a peer whose
+    // answer to one was lost ignores it from then on.
+    const fresh = reusable.filter(({ entry }) => entry.published < STALE_AFTER_PUBLISHES).length
+    const wanted = Math.max(0, Math.min(n - fresh, MAX_PENDING_OFFERS - reusable.length))
 
-    const made = []
-    for (let i = 0; i < wanted; i++) {
+    // Built side by side: each waits on candidate gathering, which is time
+    // spent waiting on the network rather than working.
+    const built = await Promise.all(Array.from({ length: wanted }, async () => {
       const offerId = randomId()
       const link = new Link({
         selfId: id,
@@ -770,7 +789,7 @@ export function joinRoom(
       })
       try {
         const sdp = await link.completeOffer()
-        if (!sdp) { link.die('no offer produced'); continue }
+        if (!sdp) { link.die('no offer produced'); return null }
 
         // Built while the network was down. It would be published, answered
         // and never connect, and it would keep being handed out for its whole
@@ -778,7 +797,7 @@ export function joinRoom(
         if (summarize(sdp).total === 0) {
           note(offerId, 'offer-discarded', 'no candidates at all; the network is probably down')
           link.die('offer had no candidates')
-          break // the rest of the batch would gather nothing either
+          return null
         }
 
         // An offer advertising nothing the outside world can route is answered
@@ -787,20 +806,35 @@ export function joinRoom(
         // address family matters as much as the count, since two peers with no
         // family in common fail exactly the same way while both look healthy.
         note(offerId, 'offer-built', describe(sdp))
-
-        offered.set(offerId, { link, at: Date.now(), sdp, published: 1 })
-        made.push({ offerId, sdp })
+        return { offerId, link, sdp }
       } catch (err) {
         note('-', 'offer-failed', err?.message ?? String(err))
         link.die('offer failed')
+        return null
       }
+    }))
+    const made = []
+    for (const offer of built) {
+      if (!offer) continue
+      if (left) { offer.link.die('room left'); continue }
+      offered.set(offer.offerId, { link: offer.link, at: Date.now(), sdp: offer.sdp, published: 1 })
+      made.push({ offerId: offer.offerId, sdp: offer.sdp })
     }
     // Everything still outstanding goes out again alongside the new ones, so
     // a tracker that introduces someone late still has something to hand over.
-    const publishing = [...made, ...reusable.map(({ offerId, sdp }) => ({ offerId, sdp }))]
-    for (const { entry } of reusable) entry.published++
+    // At most as many as the tracker will hand out. Sending every pooled
+    // offer each time made announces large enough, on a machine with many
+    // interfaces and so many candidates per offer, that trackers closed the
+    // connection over them — over and over, while a dropped peer was being
+    // sought. Least-published first, so the pool still rotates through.
+    const reused = reusable.slice(0, Math.max(0, n - made.length))
+    const publishing = [...made, ...reused.map(({ offerId, sdp }) => ({ offerId, sdp }))]
+    for (const { entry } of reused) entry.published++
+    // The one a lone peer will be handed, so ties go elsewhere next time.
+    const leader = publishing[0] && offered.get(publishing[0].offerId)
+    if (leader) leader.ledAt = ++leadSeq
     note('-', 'offers-published',
-      `${publishing.length} for the swarm (${made.length} new, ${reusable.length} still open)`)
+      `${publishing.length} for the swarm (${made.length} new, ${reused.length} reused of ${reusable.length} open)`)
     return publishing
   }
 

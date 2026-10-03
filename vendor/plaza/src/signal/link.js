@@ -37,6 +37,9 @@ export const isPolite = (selfId, peerId) => selfId > peerId
  */
 const GATHER_TIMEOUT_MS = 4000
 
+/** How long to keep gathering once a public candidate has arrived. */
+const PUBLIC_GRACE_MS = 400
+
 /**
  * Public STUN servers, always included.
  *
@@ -185,17 +188,35 @@ export class Link {
   #gathered() {
     if (this.pc.iceGatheringState === 'complete') return Promise.resolve()
     return new Promise((resolve) => {
+      let grace = null
       const done = () => {
         this.pc.removeEventListener('icegatheringstatechange', check)
+        this.pc.removeEventListener('icecandidate', onCandidate)
         clearTimeout(timer)
+        clearTimeout(grace)
         resolve()
       }
       const check = () => { if (this.pc.iceGatheringState === 'complete') done() }
+
+      // Good enough beats complete. On a machine with many interfaces —
+      // VPNs, container bridges, a phone's several radios — gathering never
+      // completes before the deadline, because some STUN request on some
+      // interface never comes back, and every offer and every answer then
+      // waited the full four seconds. Measured between a laptop and a phone.
+      // What a connection across the internet needs is a public address; once
+      // one has arrived, a moment's grace collects any siblings and the
+      // description goes.
+      const onCandidate = ({ candidate }) => {
+        if (grace || !candidate) return
+        if (/ typ (srflx|relay)/.test(candidate.candidate)) grace = setTimeout(done, PUBLIC_GRACE_MS)
+      }
+
       const timer = setTimeout(() => {
         this.#log('gather-timeout', `sending ${this.pc.localDescription ? 'partial' : 'no'} candidates`)
         done()
       }, GATHER_TIMEOUT_MS)
       this.pc.addEventListener('icegatheringstatechange', check)
+      this.pc.addEventListener('icecandidate', onCandidate)
       check()
     })
   }
