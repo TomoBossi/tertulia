@@ -64,6 +64,42 @@ export function iceConfiguration(rtcConfig) {
   }
 }
 
+/**
+ * How a connection that breaks after opening is repaired, or given up on.
+ *
+ * `restartAfterMs` is the grace before an ICE restart. `disconnected` arrives
+ * after a few missed consent checks and most of those clear on their own, so
+ * restarting at once would rebuild a working path. Only the offering side
+ * restarts — two sides restarting at once collide — and the answering side,
+ * which sees the same outage, waits twice as long and then asks it to, as a
+ * backstop for an offerer that did not notice.
+ *
+ * `giveUpMs` is how long a connection may stay broken before it is abandoned
+ * outright. The browser's own verdict takes roughly twenty seconds to arrive,
+ * and nothing is gained by waiting for it: a restart only helps while some
+ * path can still carry its offer, and when none can — the network went away,
+ * or came back under a new address — the way back is a new introduction,
+ * which cannot start until this one is let go. The room holds the peer's
+ * place meanwhile, so letting go early costs a reconnection, not the person.
+ */
+export const DEFAULT_REPAIR = { restartAfterMs: 2000, giveUpMs: 8000 }
+
+/**
+ * How long an answering connection may have a working path and no handshake.
+ *
+ * The answering side waits for the offerer to start the handshake, which it
+ * does the moment our answer reaches it. A path that connects with no
+ * handshake following means the answer never arrived — trackers lose them,
+ * and hold them for many seconds after an outage — and the connection cannot
+ * progress at all. Holding it blocks every later offer from that peer, so it
+ * is let go, and the next introduction gets through.
+ */
+const HANDSHAKE_STALL_MS = 4000
+
+/** Make an answer the side that waits for the DTLS handshake. */
+export const waitForHandshake = (sdp) => sdp.replace(/^a=setup:active\r?$/gm, (line) =>
+  line.replace('active', 'passive'))
+
 export class Link {
   /** @type {RTCPeerConnection} */ pc
   /** @type {RTCDataChannel|null} */ channel = null
@@ -72,6 +108,12 @@ export class Link {
   polite
   open = false
   dead = false
+  /**
+   * Whether the channel ever opened. `open` is cleared on death, so whoever
+   * hears about the death needs this to tell a dropped peer from a handshake
+   * that never got anywhere.
+   */
+  opened = false
 
   #send
   #emit
@@ -81,6 +123,13 @@ export class Link {
   #settingRemoteAnswer = false
   #pendingCandidates = []
   #queuedOut = []
+  #repair
+  #restartTimer = null
+  #giveUpTimer = null
+  #stallTimer = null
+  #lastRestart = 0
+  /** ICE restarts attempted on this connection, for anyone diagnosing it. */
+  restarts = 0
 
   /**
    * @param {object} options
@@ -100,16 +149,18 @@ export class Link {
    * @param {boolean} [options.trickle] false when candidates cannot be sent
    *   separately from the description that carries them
    */
-  constructor({ selfId, peerId, rtcConfig, send, emit, log, role, trickle = true }) {
+  constructor({ selfId, peerId, rtcConfig, send, emit, log, role, trickle = true, repair = DEFAULT_REPAIR }) {
     this.peerId = peerId
     this.trickle = trickle
     // With a tracker there is no id to compare — whoever's offer the tracker
     // handed out is the offerer, and there is exactly one offer per
     // connection, so a collision cannot arise in the first place.
     this.polite = role ? role === 'answer' : isPolite(selfId, peerId)
+    this.role = role ?? null
     this.#send = send
     this.#emit = emit
     this.#log = log
+    this.#repair = repair
 
     this.pc = new RTCPeerConnection(iceConfiguration(rtcConfig))
     this.#wire()
@@ -156,10 +207,23 @@ export class Link {
     return this.pc.localDescription?.sdp ?? null
   }
 
-  /** A complete answer to a complete offer. */
+  /**
+   * A complete answer to a complete offer.
+   *
+   * The answer makes us the side that waits for the encryption handshake
+   * (`setup:passive`) instead of the side that starts it. Started from here,
+   * the handshake begins the moment our candidates connect — which is before
+   * the offerer has even received this answer, because a tracker relays it
+   * on its own schedule. The offerer can do nothing with those attempts, and
+   * they back off exponentially from 50ms, so an answer delayed by a few
+   * seconds left the next attempt up to thirteen seconds away. Measured in a
+   * real run: twenty-five seconds in `connecting` on a path that worked.
+   * Started by the offerer, it begins exactly when the answer arrives.
+   */
   async completeAnswer(offerSdp) {
     await this.pc.setRemoteDescription({ type: 'offer', sdp: offerSdp })
-    await this.pc.setLocalDescription(await this.pc.createAnswer())
+    const answer = await this.pc.createAnswer()
+    await this.pc.setLocalDescription({ type: 'answer', sdp: waitForHandshake(answer.sdp) })
     await this.#gathered()
     return this.pc.localDescription?.sdp ?? null
   }
@@ -209,17 +273,29 @@ export class Link {
       this.#emit('state', this.peerId, state)
 
       // Only failed and closed are terminal. `disconnected` is routinely
-      // transient — a few missed consent checks will do it — and killing a
-      // call over it is how a working connection gets thrown away.
+      // transient — a few missed consent checks will do it — so it starts the
+      // repair clock rather than ending anything.
       if (state === 'failed' || state === 'closed') {
         this.die(state === 'failed' ? 'connection failed' : 'connection closed')
+      } else if (state === 'connected') {
+        this.#healed()
+      } else if (state === 'disconnected' && this.opened) {
+        this.#broken()
       }
     }
 
     pc.oniceconnectionstatechange = () => {
-      // Recorded but never acted on: this is the legacy aggregate and it
-      // reports `checking` indefinitely on connections that are verifiably up.
+      // Recorded, and only ever used as the start of a clock: this is the
+      // legacy aggregate and it reports `checking` indefinitely on
+      // connections that are verifiably up, so nothing is decided on it.
       this.#log('ice', pc.iceConnectionState)
+      if (this.role === 'answer' && !this.opened && !this.#stallTimer
+        && (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed')) {
+        this.#stallTimer = setTimeout(() => {
+          if (this.dead || this.opened) return
+          this.die('path up but no handshake; our answer never reached them')
+        }, HANDSHAKE_STALL_MS)
+      }
     }
 
     pc.ontrack = ({ track, streams }) => {
@@ -234,6 +310,7 @@ export class Link {
 
     channel.onopen = () => {
       this.open = true
+      this.opened = true
 
       // From here the channel carries its own negotiation. That matters most
       // for a rendezvous that could not trickle: a speculative offer is made
@@ -247,7 +324,7 @@ export class Link {
       this.#log('channel-open')
       const queued = this.#queuedOut.splice(0)
       for (const data of queued) this.send(data)
-      this.#emit('open', this.peerId)
+      this.#emit('open', this.peerId, this)
     }
 
     channel.onclose = () => this.die('data channel closed')
@@ -269,6 +346,61 @@ export class Link {
     }
   }
 
+  /** The path went quiet: schedule a restart, and a deadline. */
+  #broken() {
+    if (!this.#repair || this.#giveUpTimer || this.dead) return
+    const { restartAfterMs, giveUpMs } = this.#repair
+
+    this.#restartTimer = setTimeout(() => {
+      this.#restartTimer = null
+      if (this.dead || this.pc.connectionState === 'connected') return
+      if (this.polite) {
+        this.#log('restart-asked', 'still broken; asking the offering side to restart')
+        this.#send({ type: 'restart' })
+      } else {
+        this.restart('path went quiet')
+      }
+    }, this.polite ? restartAfterMs * 2 : restartAfterMs)
+
+    this.#giveUpTimer = setTimeout(() => {
+      this.#giveUpTimer = null
+      if (this.dead || this.pc.connectionState === 'connected') return
+      this.die(`no path for ${giveUpMs / 1000}s`)
+    }, giveUpMs)
+  }
+
+  #healed() {
+    if (this.#giveUpTimer) this.#log('healed', `after ${this.restarts} restart(s)`)
+    clearTimeout(this.#restartTimer)
+    clearTimeout(this.#giveUpTimer)
+    this.#restartTimer = null
+    this.#giveUpTimer = null
+  }
+
+  /**
+   * Renegotiate the path underneath this connection.
+   *
+   * Not a reconnection: the connection, its channels and its media survive,
+   * and only the candidate pair beneath them is replaced. Throttled, because
+   * a restart needs time to land and a second one on top of the first only
+   * restarts the restart.
+   */
+  restart(why) {
+    if (this.dead || this.polite) return false
+    const now = Date.now()
+    if (now - this.#lastRestart < (this.#repair?.restartAfterMs ?? 0)) return false
+    this.#lastRestart = now
+    this.restarts++
+    this.#log('ice-restart', `${why} (restart ${this.restarts})`)
+    try {
+      this.pc.restartIce()
+      return true
+    } catch (err) {
+      this.#log('ice-restart-failed', err?.message ?? String(err))
+      return false
+    }
+  }
+
   /**
    * Apply a signal from the peer.
    *
@@ -281,6 +413,14 @@ export class Link {
     if (this.dead) return
 
     try {
+      if (msg.type === 'restart') {
+        // They think the path is broken. They may be right before we notice,
+        // so trust them: an unnecessary restart costs a renegotiation, a
+        // missed one costs the connection.
+        this.restart('they asked')
+        return
+      }
+
       if (msg.type === 'candidate') {
         try {
           await this.pc.addIceCandidate(msg.candidate)
@@ -396,11 +536,14 @@ export class Link {
 
   die(why) {
     if (this.dead) return
+    clearTimeout(this.#restartTimer)
+    clearTimeout(this.#giveUpTimer)
+    clearTimeout(this.#stallTimer)
     this.dead = true
     this.open = false
     this.#log('dead', why)
     try { this.channel?.close() } catch { /* already gone */ }
     try { this.pc.close() } catch { /* already gone */ }
-    this.#emit('dead', this.peerId, why)
+    this.#emit('dead', this.peerId, why, this)
   }
 }

@@ -26,8 +26,29 @@
 import { Rendezvous, topicOf } from './rendezvous.js'
 import { TrackerSwarm, infoHashFor, DEFAULT_TRACKERS } from './tracker.js'
 import { roomKey, seal, open } from './secret.js'
-import { Link } from './link.js'
+import { Link, DEFAULT_REPAIR } from './link.js'
 import { describe, summarize } from './candidates.js'
+
+/**
+ * Two connections to the same peer, and which one survives.
+ *
+ * Both peers look for each other at once — at join, and again after a drop —
+ * so a tracker routinely introduces them in both directions. Choosing between
+ * the two before either works needs both sides to see both, and they do not:
+ * a tracker answer goes missing, and each side ends up keeping a connection
+ * whose other half the other side already threw away. Caught exactly that way
+ * in a real two-browser run, twice, by two successively cleverer rules.
+ *
+ * So nothing is chosen in advance. Both are kept — at most one in each
+ * direction — and whichever opens first wins. Opening is a fact both ends
+ * share, because it is the same connection; the loser is dropped then. Only
+ * when both have opened does a rule decide, and by then both sides can see
+ * both: the connection offered by the lower id wins.
+ */
+const outranks = (offererA, offererB) => offererA < offererB
+
+/** How long a connection that lost the race may still open and be weighed. */
+const RACE_GRACE_MS = 1500
 
 const ANNOUNCE_MS = 4000
 const ANNOUNCE_WARMUP_MS = [200, 600, 1500]
@@ -50,6 +71,10 @@ const PING_TIMEOUT_MS = 5000
  * already lost it is not a strategy.
  */
 const CHASE_MS = [1000, 2000, 4000, 6000, 8000]
+
+/** How often to announce while a dropped peer is being sought. */
+const SEEK_MS = [2000, 2000, 3000, 3000, 5000, 5000, 10000]
+
 const REBUILD_AFTER_CHASES = 5
 
 /**
@@ -124,6 +149,8 @@ export function joinRoom(
     chaseSchedule = CHASE_MS, rebuildAfter = REBUILD_AFTER_CHASES,
     neverStartedMs = NEVER_STARTED_MS, openingDeadlineMs = OPENING_DEADLINE_MS,
     discovery = 'tracker', trackerUrls,
+    repair = DEFAULT_REPAIR,
+    seekSchedule = SEEK_MS,
   } = {},
   roomId,
 ) {
@@ -134,6 +161,7 @@ export function joinRoom(
 
   const listeners = { onPeerJoin: null, onPeerLeave: null, onPeerStream: null }
   const links = new Map()      // peerId -> Link
+  const contenders = new Map() // peerId -> Link racing the one in `links`
   const actions = new Map()    // name -> {onMessage}
   const published = new Map()  // stream -> metadata
   const pings = new Map()      // peerId -> [{resolve, reject}]
@@ -236,6 +264,9 @@ export function joinRoom(
     state.timer = setTimeout(tick, chaseSchedule[0])
   }
 
+  /** Who made the offer behind a connection: the answering side's peer, or us. */
+  const offererOf = (link) => (link.polite ? link.peerId : id)
+
   const linkFor = (peerId) => {
     const existing = links.get(peerId)
     if (existing && !existing.dead) return existing
@@ -244,6 +275,7 @@ export function joinRoom(
       selfId: id,
       peerId,
       rtcConfig,
+      repair,
       send: (msg) => signalTo(peerId, msg),
       log: (what, detail) => note(peerId, what, detail),
       emit: (event, ...args) => handleLinkEvent(event, ...args),
@@ -307,9 +339,9 @@ export function joinRoom(
   const watchOpening = (peerId, link) => {
     const abandon = (why) => {
       if (left || link.dead || link.open) return
-      // Only if this is still the current link for that peer — it may have
+      // Only if this is still a live candidate for that peer — it may have
       // been replaced already, and killing its successor would be a new bug.
-      if (links.get(peerId) !== link) return
+      if (links.get(peerId) !== link && contenders.get(peerId) !== link) return
       note(peerId, 'abandoned', why)
       link.die(why)
       if (links.get(peerId) === link) links.delete(peerId)
@@ -326,8 +358,105 @@ export function joinRoom(
     )
   }
 
+  const sought = new Set() // peerIds dropped and not yet back
+  let seekTimer = null
+  let seekRound = 0
+
+  /**
+   * Look for a peer whose connection just failed, now rather than eventually.
+   *
+   * A dropped peer is almost always still in the room, and is most likely
+   * looking for us too. Left to the routine cadence, a tracker would not
+   * introduce us again for up to twenty seconds, which is most of the time a
+   * room is willing to hold someone's place. So the swarm announces at once,
+   * carrying fresh offers; on the relay path the link is rebuilt and chased
+   * until it opens or the room gives up on the peer with `forget`.
+   */
+  const seekAgain = (peerId) => {
+    if (left) return
+    note(peerId, 'seeking', swarm ? 'announcing to the swarm now' : 'rebuilding the link')
+    if (!swarm) { linkFor(peerId); return }
+    void swarm.announce()
+    sought.add(peerId)
+    swarm.urgent = true
+    if (!seekTimer) seekTimer = setTimeout(seekTick, seekSchedule[0])
+  }
+
+  /**
+   * Keep announcing, briskly, while anyone is being sought.
+   *
+   * One announce at the moment of the drop is not enough, because the drop
+   * is usually the network going away: that announce goes nowhere, and the
+   * routine one is twenty seconds off. Measured in a real run — the network
+   * came back and nobody was introduced until the next routine announce,
+   * twenty-five seconds later. Offers are reused rather than rebuilt, so each
+   * of these is one small message per tracker.
+   */
+  const seekTick = () => {
+    seekTimer = null
+    if (left) return
+    for (const peerId of sought) {
+      if (links.get(peerId)?.open) sought.delete(peerId)
+    }
+    if (sought.size === 0) { seekRound = 0; if (swarm) swarm.urgent = false; return }
+    seekRound++
+    void swarm?.announce()
+    seekTimer = setTimeout(seekTick, seekSchedule[Math.min(seekRound, seekSchedule.length - 1)])
+  }
+
+  // The browser noticing the network come back is the best moment of all.
+  const onOnline = () => {
+    if (left || !swarm) return
+    // Fresh tracker connections — the old ones are deaf for a while after an
+    // outage — and back to the brisk end of the schedule, which a long
+    // outage has long since left behind. Reopening announces by itself.
+    note('-', 'online', 'network is back; reopening tracker connections')
+    swarm.refresh?.()
+    if (sought.size === 0) return
+    seekRound = 0
+    clearTimeout(seekTimer)
+    seekTimer = setTimeout(seekTick, seekSchedule[0])
+  }
+  globalThis.addEventListener?.('online', onOnline)
+
   const handleLinkEvent = (event, peerId, ...rest) => {
     if (event === 'open') {
+      const opened = rest[0]
+      const current = links.get(peerId)
+      if (opened && current !== opened) {
+        if (contenders.get(peerId) === opened) contenders.delete(peerId)
+        if (current?.open) {
+          // Both made it. Both sides can see both now, so the rule decides,
+          // and decides the same way on each end.
+          if (!outranks(offererOf(opened), offererOf(current))) {
+            opened.die('duplicate connection; the other one wins')
+            return
+          }
+          // Ours displaces a working connection. To everything above, that
+          // is the peer dropping and returning at once — and handled as one,
+          // so streams and channels move across to the new connection.
+          note(peerId, 'superseded', 'both connections opened; keeping the one the lower id offered')
+          links.set(peerId, opened)
+          current.die('superseded by the connection both sides keep')
+          listeners.onPeerLeave?.(peerId, Object.assign(new Error('connection replaced'), { dropped: true }))
+        } else {
+          links.set(peerId, opened)
+          if (current && !current.dead) current.die('the other connection opened first')
+        }
+      }
+      // First to open wins — but the two ends may see the two connections
+      // open in opposite orders when they finish moments apart. So the one
+      // still racing gets a brief grace: if it opens within it, both ends
+      // can see both, and the rule above settles it the same way on each.
+      const loser = contenders.get(peerId)
+      if (loser && loser !== opened) {
+        setTimeout(() => {
+          if (contenders.get(peerId) !== loser || loser.open) return
+          contenders.delete(peerId)
+          loser.die('the other connection opened first')
+        }, RACE_GRACE_MS)
+      }
+
       stopChasing(peerId)
       note(peerId, 'connected')
       // Anything already being shared goes to the newcomer immediately.
@@ -344,12 +473,25 @@ export function joinRoom(
 
     if (event === 'dead') {
       const why = rest[0]
+      const dying = rest[1]
+      // A connection that lost a race, or was replaced, says nothing about
+      // the peer: whatever is current for them is still current.
+      if (dying && links.get(peerId) !== dying) {
+        if (contenders.get(peerId) === dying) contenders.delete(peerId)
+        return
+      }
       const link = links.get(peerId)
-      const wasOpen = link?.open
+      const wasOpen = link?.opened
       // A rebuild kills the old link deliberately; that is not a departure and
       // must not be reported as one.
       if (why === 'rebuilding after failed discovery') return
       links.delete(peerId)
+      // An attempt to reach someone we are looking for just failed. The next
+      // one should not wait for the schedule.
+      if (!wasOpen && sought.has(peerId) && swarm && !left) {
+        note(peerId, 'seeking', `attempt failed (${why}); announcing again now`)
+        void swarm.announce()
+      }
       // Reject anything waiting on this peer rather than leaving it hanging.
       for (const waiter of pings.get(peerId) ?? []) waiter.reject(new Error(why))
       pings.delete(peerId)
@@ -357,7 +499,15 @@ export function joinRoom(
       pendingTracks.delete(peerId)
       streamMeta.delete(peerId)
       note(peerId, 'gone', why)
-      if (wasOpen) listeners.onPeerLeave?.(peerId, new Error(why))
+      if (wasOpen) {
+        // Nobody said goodbye, so this is a failure rather than a departure,
+        // and the peer is very likely still there. Saying which lets the room
+        // hold their place instead of forgetting them.
+        const reason = new Error(why)
+        reason.dropped = true
+        listeners.onPeerLeave?.(peerId, reason)
+        seekAgain(peerId)
+      }
       return
     }
 
@@ -528,9 +678,15 @@ export function joinRoom(
     // replacements, which is the very race the lifetime was added to stop.
     // Unanswered offers are still perfectly good, so they are re-announced
     // rather than replaced.
-    const reusable = [...offered.entries()].map(([offerId, entry]) => ({
-      offerId, sdp: entry.sdp,
-    }))
+    // Least-published first. A tracker hands offers out in order, so with a
+    // single other peer it is always the first one that reaches them — and
+    // if their answer to it was lost, they have marked it handled and ignore
+    // it from then on. Re-announcing in a fixed order handed them that same
+    // offer every time until it expired, two minutes later. Rotating means
+    // each announce carries one they have not seen.
+    const reusable = [...offered.entries()]
+      .sort(([, a], [, b]) => a.published - b.published)
+      .map(([offerId, entry]) => ({ offerId, sdp: entry.sdp, entry }))
     const wanted = Math.max(0, Math.min(n, MAX_PENDING_OFFERS - reusable.length))
 
     const made = []
@@ -541,6 +697,7 @@ export function joinRoom(
         role: 'offer',
         trickle: false,
         rtcConfig,
+        repair,
         send: (msg) => { if (link.peerId) signalTo(link.peerId, msg) },
         log: (what, detail) => note(offerId, what, detail),
         emit: (event, ...args) => handleLinkEvent(event, ...args),
@@ -549,6 +706,15 @@ export function joinRoom(
         const sdp = await link.completeOffer()
         if (!sdp) { link.die('no offer produced'); continue }
 
+        // Built while the network was down. It would be published, answered
+        // and never connect, and it would keep being handed out for its whole
+        // lifetime — long after the network came back.
+        if (summarize(sdp).total === 0) {
+          note(offerId, 'offer-discarded', 'no candidates at all; the network is probably down')
+          link.die('offer had no candidates')
+          break // the rest of the batch would gather nothing either
+        }
+
         // An offer advertising nothing the outside world can route is answered
         // normally and then simply never connects, because there is no pair
         // for ICE to try. That is silent unless it is counted here — and the
@@ -556,7 +722,7 @@ export function joinRoom(
         // family in common fail exactly the same way while both look healthy.
         note(offerId, 'offer-built', describe(sdp))
 
-        offered.set(offerId, { link, at: Date.now(), sdp })
+        offered.set(offerId, { link, at: Date.now(), sdp, published: 1 })
         made.push({ offerId, sdp })
       } catch (err) {
         note('-', 'offer-failed', err?.message ?? String(err))
@@ -565,7 +731,8 @@ export function joinRoom(
     }
     // Everything still outstanding goes out again alongside the new ones, so
     // a tracker that introduces someone late still has something to hand over.
-    const publishing = [...reusable, ...made]
+    const publishing = [...made, ...reusable.map(({ offerId, sdp }) => ({ offerId, sdp }))]
+    for (const { entry } of reusable) entry.published++
     note('-', 'offers-published',
       `${publishing.length} for the swarm (${made.length} new, ${reusable.length} still open)`)
     return publishing
@@ -574,9 +741,16 @@ export function joinRoom(
   const answerOffer = async ({ peerId, offerId, sdp }) => {
     if (left) return null
     const existing = links.get(peerId)
+    let racing = false
     if (existing && !existing.dead) {
-      note(peerId, 'offer-skipped', 'already connecting or connected')
-      return null
+      // A working connection is never traded for a hypothetical one, and
+      // there is at most one connection in each direction. Otherwise theirs
+      // races ours, and whichever opens first wins.
+      if (existing.open || existing.polite || contenders.has(peerId)) {
+        note(peerId, 'offer-skipped', existing.open ? 'already connected' : 'already answering one of theirs')
+        return null
+      }
+      racing = true
     }
 
     const link = new Link({
@@ -585,20 +759,22 @@ export function joinRoom(
       role: 'answer',
       trickle: false,
       rtcConfig,
+      repair,
       send: (msg) => signalTo(peerId, msg),
       log: (what, detail) => note(peerId, what, detail),
       emit: (event, ...args) => handleLinkEvent(event, ...args),
     })
-    links.set(peerId, link)
+    if (racing) contenders.set(peerId, link)
+    else links.set(peerId, link)
     watchOpening(peerId, link)
-    note(peerId, 'answering', `offer ${offerId.slice(0, 6)} from the swarm`)
+    note(peerId, 'answering', `offer ${offerId.slice(0, 6)} from the swarm${racing ? ', racing ours' : ''}`)
 
     try {
       return await link.completeAnswer(sdp)
     } catch (err) {
       note(peerId, 'answer-failed', err?.message ?? String(err))
       link.die('answer failed')
-      links.delete(peerId)
+      if (links.get(peerId) === link) links.delete(peerId)
       return null
     }
   }
@@ -613,15 +789,24 @@ export function joinRoom(
     offered.delete(offerId)
 
     const existing = links.get(peerId)
+    let racing = false
     if (existing && !existing.dead) {
-      // Two of our offers were answered by the same peer, or they answered
-      // while we were already answering theirs. One connection each.
-      link.die('duplicate introduction')
-      return
+      // Two of our offers answered by the same peer is one too many; an
+      // answer while we are answering theirs races it.
+      if (existing.open || !existing.polite || contenders.has(peerId)) {
+        link.die('duplicate introduction')
+        return
+      }
+      racing = true
     }
 
     link.identify(peerId)
-    links.set(peerId, link)
+    if (racing) {
+      contenders.set(peerId, link)
+      note(peerId, 'racing', 'answered while we were answering theirs; first to open wins')
+    } else {
+      links.set(peerId, link)
+    }
 
     // Their half of the same question. Reported together with ours below, so
     // a missing overlap reads as one fact rather than two logs to compare.
@@ -741,6 +926,25 @@ export function joinRoom(
       return Promise.all([...links.values()].map((l) => l.replaceTrack(oldTrack, newTrack)))
     },
 
+    /**
+     * Stop looking for a peer whose place is no longer being held.
+     *
+     * Only the relay path keeps looking for someone in particular; a swarm
+     * introduces whoever is there. Either way, whatever half-built connection
+     * exists for them is dropped.
+     */
+    forget(peerId) {
+      stopChasing(peerId)
+      sought.delete(peerId)
+      if (swarm && sought.size === 0) swarm.urgent = false
+      contenders.get(peerId)?.die('no longer looking for this peer')
+      const link = links.get(peerId)
+      if (link && !link.open) {
+        links.delete(peerId)
+        link.die('no longer looking for this peer')
+      }
+    },
+
     async ping(peerId) {
       const link = links.get(peerId)
       if (!link || !link.open) throw new Error(`no active peer with id ${peerId}`)
@@ -761,6 +965,8 @@ export function joinRoom(
       if (left) return
       left = true
       clearTimeout(announceTimer)
+      clearTimeout(seekTimer)
+      globalThis.removeEventListener?.('online', onOnline)
 
       // Say goodbye before tearing down, so peers show a departure rather than
       // waiting for a timeout to call it a failure.
@@ -769,6 +975,8 @@ export function joinRoom(
 
       for (const peerId of [...chases.keys()]) stopChasing(peerId)
       for (const link of links.values()) link.die('room left')
+      for (const link of contenders.values()) link.die('room left')
+      contenders.clear()
       for (const entry of offered.values()) entry.link.die('room left')
       links.clear()
       offered.clear()

@@ -25,6 +25,8 @@ import { watchConnection } from './diagnostics.js'
  *
  * @fires peer:join    (peer)
  * @fires peer:leave   (peer)
+ * @fires peer:interrupted (peer, reason)   connection lost; place held
+ * @fires peer:reconnected (peer)           back within the hold
  * @fires peer:update  (peer)                presence changed
  * @fires peer:stream  (peer, stream, kind)  stream arrived, or null if ended
  * @fires peer:net     (peer, net)           connection quality changed
@@ -89,24 +91,29 @@ export class Room extends Emitter {
   #bitrateJob = Promise.resolve()
   #bitrateRetry = null
 
-  /**
-   * Whether to intervene in a handshake that is going badly.
-   *
-   * Off, the browser's own ICE machinery is left entirely alone. This exists
-   * to be switched: every recovery here is a guess about why a connection
-   * failed, and a guess that fires on a handshake which was about to succeed
-   * makes things worse, not better. Being able to turn the whole apparatus off
-   * is the only way to find out which it is doing.
-   */
-  #recover = true
-  #watched = new WeakMap()
   #strained = new Set()
 
-  constructor(signalRoom, { presence = {}, recover = true } = {}) {
+  /**
+   * How long a peer whose connection failed keeps its place, in milliseconds.
+   *
+   * A connection failing is a symptom, not a decision: the person is almost
+   * always still there, on a phone that changed networks or a laptop that
+   * dropped a few seconds of wifi. Forgetting them at once throws away who
+   * they are, what they were showing and whatever the application had
+   * attached to them, only to rebuild all of it moments later as a stranger.
+   *
+   * Zero restores the old behaviour, and Infinity holds a place until the
+   * application calls {@link Room#drop}. Someone who says goodbye is never
+   * held: leaving is a decision.
+   */
+  #readmitMs = 30000
+  #held = new Map() // peerId -> { timer, reason }
+
+  constructor(signalRoom, { presence = {}, readmitMs = 30000 } = {}) {
     super()
     this.#room = signalRoom
     this.presence = { ...presence }
-    this.#recover = recover
+    this.#readmitMs = readmitMs
     this.selfId = signalRoom.selfId ?? defaultSelfId
 
     this.#wirePresence()
@@ -135,6 +142,7 @@ export class Room extends Emitter {
    */
   static async join({
     room, appId = 'plaza', password, nick, presence, rtcConfig, recover = true, discovery,
+    readmitMs,
   } = {}) {
     if (!room || !String(room).trim()) {
       throw new Error('plaza: a room name is required')
@@ -147,6 +155,10 @@ export class Room extends Emitter {
 
     const config = {
       appId,
+      // Whether a connection that breaks is repaired in place. Off, the
+      // browser's own ICE machinery is left entirely alone, which is the
+      // only way to tell whether a repair is helping or making things worse.
+      ...(recover ? {} : { repair: null }),
       ...(password ? { password } : {}),
       ...(rtcConfig ? { rtcConfig } : {}),
       ...(discovery ? { discovery } : {}),
@@ -154,7 +166,9 @@ export class Room extends Emitter {
     const name = String(room).trim()
 
     const tr = joinRoom(config, name)
-    const roomInstance = new Room(tr, { presence: initial, recover })
+    const roomInstance = new Room(tr, {
+      presence: initial, ...(readmitMs != null ? { readmitMs } : {}),
+    })
 
     // Keys and topics resolve asynchronously; waiting means a caller that
     // joins and immediately sends is not racing setup.
@@ -177,7 +191,12 @@ export class Room extends Emitter {
       this.emit('peer:stream', peer, null, kind)
       this.emit('peer:update', peer)
     }
+    // Someone asking us to say who we are again; see #expectHello.
+    this.#who = this.#room.makeAction('plz.who')
+    this.#who.onMessage = (_data, { peerId }) => this.#announce(peerId)
+
     this.#hello.onMessage = (data, { peerId }) => {
+      this.#heard.add(peerId)
       const peer = this.#ensure(peerId)
       peer.presence = data && typeof data === 'object' ? data : {}
       // Mirrored onto the peer so callers can write peer.nick without
@@ -189,6 +208,9 @@ export class Room extends Emitter {
 
   #hello
   #unstream
+  #who
+  #heard = new Set()
+  #helloChecks = new Map() // peerId -> timer
 
   /**
    * Replace what we are broadcasting about ourselves.
@@ -225,6 +247,33 @@ export class Room extends Emitter {
     return this.updatePresence({ nick: String(nick ?? '').slice(0, 60) })
   }
 
+  /**
+   * Make sure a peer's hello actually arrives, and ask again if it does not.
+   *
+   * Each side says who it is once, the moment the connection opens. In a
+   * real two-browser run one of those two messages simply never arrived — the
+   * sender wrote it to an open channel without error, and the receiver never
+   * saw it — leaving a peer connected for the rest of the call with no name
+   * and no presence. Nothing would ever have re-sent it.
+   *
+   * So the receiving side checks. Asking costs one message; a peer running a
+   * version that does not know the question ignores it.
+   */
+  #expectHello(peerId, attempt = 1) {
+    if (attempt === 1) {
+      this.#heard.delete(peerId)
+      clearTimeout(this.#helloChecks.get(peerId))
+    }
+    this.#helloChecks.set(peerId, setTimeout(() => {
+      this.#helloChecks.delete(peerId)
+      if (this.#left || this.#heard.has(peerId) || !this.peers.has(peerId)) return
+      if (this.#held.has(peerId)) return
+      this.#note(peerId, 'hello-missing', `nothing heard ${attempt * HELLO_WAIT_MS / 1000}s after connecting; asking again`)
+      this.#who.send(null, { target: peerId }).catch(() => {})
+      if (attempt < HELLO_ATTEMPTS) this.#expectHello(peerId, attempt + 1)
+    }, HELLO_WAIT_MS))
+  }
+
   #announce(target) {
     this.#hello.send(this.presence, target ? { target } : undefined).catch(() => {})
   }
@@ -233,6 +282,7 @@ export class Room extends Emitter {
 
   #wirePeers() {
     this.#room.onPeerJoin = async (peerId) => {
+      const held = this.#held.get(peerId)
       const peer = this.#ensure(peerId)
 
       // Announced first, and before anything that can fail.
@@ -244,19 +294,23 @@ export class Room extends Emitter {
       // left a peer that had genuinely connected sitting at "connecting"
       // forever, with the application never told it had arrived — the failure
       // presenting as the one thing it was not, a connection problem.
-      this.#note(peerId, 'join')
-      this.emit('peer:join', peer)
+      //
+      // Someone whose place was being held is not a newcomer, and is not
+      // announced as one.
+      if (held) {
+        this.#readmit(peer, held)
+      } else {
+        this.#note(peerId, 'join')
+        this.emit('peer:join', peer)
+      }
 
       // Someone arriving late has missed everything said so far, so both our
       // identity and our streams are repeated privately for them.
       this.#announce(peerId)
+      this.#expectHello(peerId)
 
       // Raw channels are per peer connection and must be created for each one.
       for (const raw of this.#rawChannels.values()) raw.attach(peerId)
-
-      // Watch the path from the first moment there is one to watch.
-      const pc = this.#room.getPeers()[peerId]
-      if (pc) this.#watchIce(peerId, pc)
 
       // Each step is independently survivable, so one failing does not cancel
       // the rest. A new peer means new senders and receivers, which inherit
@@ -278,33 +332,133 @@ export class Room extends Emitter {
       const peer = this.peers.get(peerId)
       if (!peer) return
 
-      // Why, not just that. The transport distinguishes a goodbye from a
-      // dead channel from a failed handshake, and those need completely
-      // different responses — but it discarded the distinction before
-      // telling anyone, so every drop looked the same in the log. It is
-      // patched to pass it through; see vendor/PATCHES.md.
-      const why = reason?.message ?? 'no reason given'
-      const pc = this.#room.getPeers()[peerId]
-      const live = pc
-        ? `${pc.connectionState}/${pc.iceConnectionState}`
-        : 'connection already gone'
-
-      this.peers.delete(peerId)
-      this.#strained.delete(peerId)
-      for (const raw of this.#rawChannels.values()) raw.detach(peerId)
-      // Anything waiting on this peer will never be answered.
-      for (const channel of this.#requests.values()) {
-        for (const [id, waiting] of channel.pending) {
-          clearTimeout(waiting.timer)
-          channel.pending.delete(id)
-          waiting.reject(new Error('plaza: peer left before answering'))
-        }
+      // The transport says whether anyone said goodbye. A connection that
+      // failed without one is held open for a while, because the person on
+      // the other end very likely did not go anywhere.
+      if (reason?.dropped && this.#readmitMs > 0 && !this.#left) {
+        this.#hold(peer, reason)
+        return
       }
-
-      this.#note(peerId, 'leave',
-        `${why} — last seen ${peer.net.state}, path ${peer.net.path ?? '-'}, now ${live}`)
-      this.emit('peer:leave', peer, reason)
+      this.#release(peer, reason)
     }
+  }
+
+  /** Keep a dropped peer's place, and say so. */
+  #hold(peer, reason) {
+    const peerId = peer.id
+    if (this.#held.has(peerId)) return
+
+    // Whatever lived on the old connection is gone with it. Raw channels are
+    // per connection and are attached afresh if the peer comes back.
+    for (const raw of this.#rawChannels.values()) raw.detach(peerId)
+    this.#strained.delete(peerId)
+
+    const timer = Number.isFinite(this.#readmitMs)
+      ? setTimeout(() => this.#expire(peerId), this.#readmitMs)
+      : null
+    this.#held.set(peerId, { timer, reason, since: Date.now() })
+
+    peer.reconnecting = true
+    peer.net = { ...peer.net, state: 'disconnected' }
+
+    this.#note(peerId, 'held',
+      `${reason?.message ?? 'connection lost'} — holding their place for `
+      + `${Number.isFinite(this.#readmitMs) ? `${this.#readmitMs / 1000}s` : 'as long as it takes'}`)
+    this.emit('peer:interrupted', peer, reason)
+    this.emit('peer:net', peer, peer.net)
+  }
+
+  /**
+   * Welcome back a peer whose place was being held.
+   *
+   * Their streams come back over the new connection under the same kinds, and
+   * replace the dead ones as they arrive. Anything they were showing before
+   * that does not come back within a few seconds stopped while they were
+   * away, and is ended here rather than left frozen on the wall.
+   */
+  #readmit(peer, held) {
+    clearTimeout(held.timer)
+    this.#held.delete(peer.id)
+    peer.reconnecting = false
+    peer.net = { ...peer.net, state: 'connecting' }
+
+    const before = { ...peer.streams }
+    setTimeout(() => {
+      if (this.#left || this.peers.get(peer.id) !== peer) return
+      for (const [kind, stream] of Object.entries(before)) {
+        if (peer.streams[kind] !== stream) continue
+        delete peer.streams[kind]
+        this.emit('peer:stream', peer, null, kind)
+        this.emit('peer:update', peer)
+      }
+    }, STALE_STREAM_MS)
+
+    this.#note(peer.id, 'readmitted', `back after ${((Date.now() - held.since) / 1000).toFixed(1)}s`)
+    this.emit('peer:reconnected', peer)
+  }
+
+  /** The hold ran out without them coming back. */
+  #expire(peerId) {
+    const held = this.#held.get(peerId)
+    const peer = this.peers.get(peerId)
+    if (!held || !peer) return
+    this.#held.delete(peerId)
+
+    // Still reported as a failure rather than a departure: they did not
+    // leave, we stopped waiting.
+    peer.net = { ...peer.net, state: 'failed' }
+    this.#room.forget?.(peerId)
+    const reason = new Error(`${held.reason?.message ?? 'connection lost'}; not back within the hold`)
+    reason.dropped = true
+    this.#release(peer, reason)
+  }
+
+  /**
+   * Stop holding a dropped peer's place, now.
+   *
+   * For applications that decide waiting is no longer worth it before the
+   * hold runs out — or that hold indefinitely and choose their own moment.
+   * Returns whether anyone was being held under that id.
+   */
+  drop(peerId) {
+    if (!this.#held.has(peerId)) return false
+    clearTimeout(this.#held.get(peerId).timer)
+    this.#expire(peerId)
+    return true
+  }
+
+  /** Forget a peer entirely. */
+  #release(peer, reason) {
+    const peerId = peer.id
+
+    // Why, not just that: a goodbye, a dead channel and a failed handshake
+    // need completely different responses, and the log is where the
+    // difference survives.
+    const why = reason?.message ?? 'no reason given'
+    const pc = this.#room.getPeers()[peerId]
+    const live = pc
+      ? `${pc.connectionState}/${pc.iceConnectionState}`
+      : 'connection already gone'
+
+    this.peers.delete(peerId)
+    this.#strained.delete(peerId)
+    this.#heard.delete(peerId)
+    clearTimeout(this.#helloChecks.get(peerId))
+    this.#helloChecks.delete(peerId)
+    for (const raw of this.#rawChannels.values()) raw.detach(peerId)
+    // Anything waiting on this peer will never be answered.
+    for (const channel of this.#requests.values()) {
+      for (const [id, waiting] of channel.pending) {
+        if (waiting.target !== peerId) continue
+        clearTimeout(waiting.timer)
+        channel.pending.delete(id)
+        waiting.reject(new Error('plaza: peer left before answering'))
+      }
+    }
+
+    this.#note(peerId, 'leave',
+      `${why} — last seen ${peer.net.state}, path ${peer.net.path ?? '-'}, now ${live}`)
+    this.emit('peer:leave', peer, reason)
   }
 
   /**
@@ -549,7 +703,7 @@ export class Room extends Emitter {
         reject(new Error(`plaza: ${name} request timed out`))
       }, timeout)
 
-      channel.pending.set(id, { resolve, reject, timer })
+      channel.pending.set(id, { resolve, reject, timer, target })
       channel.action.send({ ask: id, data }, { target }).catch((err) => {
         clearTimeout(timer)
         channel.pending.delete(id)
@@ -882,10 +1036,6 @@ export class Room extends Emitter {
       if (changed) this.emit('peer:net', peer, net)
 
       this.#noteStrain(peerId, net)
-
-      // Safety net. The watcher is attached the moment a peer joins; this
-      // catches any connection that appeared by some other route.
-      this.#watchIce(peerId, pc)
     }
   }
 
@@ -919,79 +1069,6 @@ export class Room extends Emitter {
     }
   }
 
-  /**
-   * Watch one peer connection, keyed to the connection object itself.
-   *
-   * The transport replaces this object whenever it rebuilds, and state kept
-   * under the peer's name outlives the connection it described — so each
-   * connection carries its own watcher and its own flags.
-   *
-   * Everything here keys off `connectionState`, never `iceConnectionState`.
-   * The legacy ICE state lies after the renegotiations this stack performs
-   * routinely (adding media right after the data channel opens): Chrome can
-   * report `checking` indefinitely on a connection that is verifiably up —
-   * the data channel is open and the application handshake completed over it.
-   * Both field logs of "stuck connecting" show exactly that signature, and a
-   * recovery keyed to the lying state restarted healthy calls, which is where
-   * the join/leave churn came from.
-   */
-  #watchIce(peerId, pc) {
-    if (this.#watched.has(pc)) return
-    this.#watched.set(pc, { restarted: false })
-
-    try {
-      const onChange = () => this.#onConnectionState(peerId, pc)
-      pc.addEventListener('connectionstatechange', onChange)
-      onChange()
-    } catch (err) {
-      this.#note(peerId, 'ice-watch-failed', err?.message ?? String(err))
-    }
-  }
-
-  #onConnectionState(peerId, pc) {
-    if (this.#left || !this.#recover) return
-    const own = this.#watched.get(pc)
-    if (!own) return
-
-    const state = pc.connectionState
-
-    if (state === 'connected') {
-      own.restarted = false
-      return
-    }
-
-    // Only `disconnected` is acted on, and only with a restart-in-place.
-    //
-    // This is the one intervention the transport's signaling can actually
-    // carry: after a connection is up, every renegotiation — this restart
-    // offer included — travels over the connection's own data channel. A path
-    // that has genuinely died therefore cannot be rescued from here at all;
-    // the offer sinks with the ship, and the transport's five-second teardown
-    // and rebuild-from-scratch is the real recovery. What a restart does fix
-    // is the half-broken path: consent checks failing while the channel still
-    // delivers, which is exactly the case the wifi logs show it recovering.
-    if (state !== 'disconnected') return
-    if (own.restarted) return
-    own.restarted = true
-
-    // Only one side offers, or the two collide mid-renegotiation.
-    const delay = this.selfId < peerId ? 0 : 1200
-    setTimeout(() => {
-      if (this.#left) return
-      if (pc.connectionState !== 'disconnected') return
-      this.#restartIce(peerId, pc, 'path went quiet; regathering')
-    }, delay)
-  }
-
-  #restartIce(peerId, pc, why) {
-    try {
-      pc.restartIce()
-      this.#note(peerId, 'ice-restart', why)
-    } catch (err) {
-      this.#note(peerId, 'ice-restart-failed', err.message)
-    }
-  }
-
   /** Measure round-trip time to a peer. */
   async ping(peerId) {
     try {
@@ -1008,6 +1085,10 @@ export class Room extends Emitter {
     this.#left = true
 
     clearInterval(this.#netTimer)
+    for (const { timer } of this.#held.values()) clearTimeout(timer)
+    for (const timer of this.#helloChecks.values()) clearTimeout(timer)
+    this.#helloChecks.clear()
+    this.#held.clear()
     clearTimeout(this.#bitrateRetry)
     this.#bitrateRetry = null
     for (const channel of [...this.#channels.values()]) channel.close()
@@ -1021,6 +1102,18 @@ export class Room extends Emitter {
     this.clearListeners()
   }
 }
+
+/**
+ * How long a readmitted peer has to send each stream again before the one it
+ * had before the drop is declared ended. Stream labels wait up to two seconds
+ * for their metadata in the transport, so this leaves room for that and a
+ * renegotiation on a slow path.
+ */
+const STALE_STREAM_MS = 6000
+
+/** How long to wait for a peer's hello before asking again, and how often. */
+const HELLO_WAIT_MS = 2000
+const HELLO_ATTEMPTS = 3
 
 /** Convenience alias matching the package entry point. */
 export const join = Room.join.bind(Room)

@@ -55,6 +55,13 @@ export class TrackerSwarm {
   /** Someone answered one of our offers. */
   onAnswer = () => {}
 
+  /**
+   * Set while someone we were connected to is missing. A tracker we cannot
+   * reach is then retried at the base interval rather than backing off
+   * towards a minute: the network coming back is exactly when we need it.
+   */
+  urgent = false
+
   #urls
   #sockets = new Map()
   #infoHash
@@ -62,6 +69,8 @@ export class TrackerSwarm {
   #log
   #closed = false
   #announceTimer = null
+  #retryTimers = new Map() // url -> pending reconnect
+  #attempts = new Map()    // url -> consecutive failures, for backoff
   #handled = new Set()
   #lastSent = 'nothing yet'
 
@@ -74,35 +83,64 @@ export class TrackerSwarm {
     this.#announceTimer = setInterval(() => void this.announce(), ANNOUNCE_MS)
   }
 
-  #connect(url, attempt = 0) {
+  /**
+   * Open the connection to one tracker, replacing any there already is.
+   *
+   * Exactly one connection and at most one pending reconnect per tracker.
+   * Reconnects used to be fire-and-forget timers, so reopening on purpose
+   * left the old chain running beside the new one: two sockets per tracker,
+   * the second replacing a working first a few seconds later, and a backoff
+   * that only ever grew.
+   */
+  #connect(url) {
     if (this.#closed) return
+    clearTimeout(this.#retryTimers.get(url))
+    this.#retryTimers.delete(url)
+    this.#drop(url)
 
     let ws
     try {
       ws = new WebSocket(url)
     } catch (err) {
-      this.#retry(url, attempt, err?.message ?? 'construct failed')
+      this.#retry(url, err?.message ?? 'construct failed')
       return
     }
     this.#sockets.set(url, ws)
 
     ws.onopen = () => {
+      this.#attempts.set(url, 0)
       this.#log('tracker-open', url)
       void this.announce(ws)
     }
     ws.onclose = () => {
-      if (this.#sockets.get(url) === ws) this.#sockets.delete(url)
-      this.#retry(url, attempt, 'closed')
+      if (this.#sockets.get(url) !== ws) return
+      this.#sockets.delete(url)
+      this.#retry(url, 'closed')
     }
     ws.onerror = () => { /* onclose follows */ }
     ws.onmessage = (event) => void this.#receive(url, ws, event.data)
   }
 
-  #retry(url, attempt, why) {
-    if (this.#closed) return
-    const delay = Math.min(RECONNECT_MS * 2 ** attempt, MAX_BACKOFF_MS)
+  /** Close a tracker connection without it scheduling its own reconnect. */
+  #drop(url) {
+    const ws = this.#sockets.get(url)
+    if (!ws) return
+    this.#sockets.delete(url)
+    ws.onclose = null
+    ws.onmessage = null
+    try { ws.close() } catch { /* already gone */ }
+  }
+
+  #retry(url, why) {
+    if (this.#closed || this.#retryTimers.has(url)) return
+    const attempt = this.#attempts.get(url) ?? 0
+    this.#attempts.set(url, attempt + 1)
+    const delay = this.urgent ? RECONNECT_MS : Math.min(RECONNECT_MS * 2 ** attempt, MAX_BACKOFF_MS)
     this.#log('tracker-retry', `${url} (${why}) in ${delay}ms`)
-    setTimeout(() => this.#connect(url, attempt + 1), delay)
+    this.#retryTimers.set(url, setTimeout(() => {
+      this.#retryTimers.delete(url)
+      this.#connect(url)
+    }, delay))
   }
 
   async #receive(url, ws, raw) {
@@ -131,6 +169,10 @@ export class TrackerSwarm {
         peerId: msg.peer_id, offerId: msg.offer_id, sdp: msg.offer.sdp,
       })
       if (!answer || this.#closed) return
+      // Only through the tracker that brought the offer. Sending it through
+      // the others too looked like redundancy and is harmful: one refuses an
+      // answer to an offer it did not carry, and another closes the
+      // connection over it.
       this.#send(ws, {
         to_peer_id: msg.peer_id,
         offer_id: msg.offer_id,
@@ -174,6 +216,11 @@ export class TrackerSwarm {
    */
   async announce(only = null) {
     if (this.#closed) return
+    // Nothing is sent while the browser knows it is offline. An announce
+    // written then sits in the socket and goes out the moment the network
+    // returns, late, re-registering us on a connection about to be replaced
+    // — and the tracker then sends our introductions to it.
+    if (globalThis.navigator?.onLine === false) return
     const sockets = only ? [only] : [...this.#sockets.values()].filter((ws) => ws.readyState === 1)
     if (sockets.length === 0) return
 
@@ -199,6 +246,26 @@ export class TrackerSwarm {
     }
   }
 
+  /**
+   * Replace every tracker connection with a fresh one, for when the network
+   * comes back.
+   *
+   * A connection that lived through an outage looks open and is deaf for a
+   * while: the tracker went on sending to us while we could not hear it, its
+   * retransmissions backed off, and everything since queues behind the next
+   * attempt. Measured in real runs, about twenty-five seconds in which we
+   * could announce and hear nothing back. A new connection has no backlog.
+   * It is safe because nothing was written to the old one while offline.
+   */
+  refresh() {
+    if (this.#closed) return
+    this.#log('tracker-refresh', `reopening ${this.#urls.length} tracker connection(s)`)
+    for (const url of this.#urls) {
+      this.#attempts.set(url, 0)
+      this.#connect(url)
+    }
+  }
+
   get liveCount() {
     let n = 0
     for (const ws of this.#sockets.values()) if (ws.readyState === 1) n++
@@ -208,6 +275,8 @@ export class TrackerSwarm {
   close() {
     this.#closed = true
     clearInterval(this.#announceTimer)
+    for (const timer of this.#retryTimers.values()) clearTimeout(timer)
+    this.#retryTimers.clear()
     for (const ws of this.#sockets.values()) {
       try { ws.close() } catch { /* already gone */ }
     }
