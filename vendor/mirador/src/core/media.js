@@ -32,6 +32,7 @@ export class LocalMedia extends Emitter {
   videoEnabled = true
 
   #deviceIds = { audioinput: null, videoinput: null }
+  #videoTicket = 0
   #devicesBound = false
 
   /** True when this browser can share a screen at all. */
@@ -128,9 +129,50 @@ export class LocalMedia extends Emitter {
     this.emit('state', this.state())
   }
 
-  setVideoEnabled(on) {
+  /**
+   * Turn the camera on or off.
+   *
+   * Off stops the camera track, which releases the camera itself: a track
+   * that is only disabled keeps the camera capturing frames nobody sees, and
+   * on a phone you can feel it. The stopped track stays in the stream, so
+   * whatever sends it keeps its place.
+   *
+   * On asks for a fresh camera and announces it the way switching devices
+   * does — a `track` swap, then the new `stream` — so senders replace the
+   * track in place and nothing renegotiates. Starting a camera takes a
+   * moment; a quick off-on-off never leaves one running.
+   */
+  async setVideoEnabled(on) {
     this.videoEnabled = on
-    for (const track of this.stream?.getVideoTracks() ?? []) track.enabled = on
+    const ticket = ++this.#videoTicket
+    const old = this.stream?.getVideoTracks()[0]
+    if (!on || !old || old.readyState === 'live') {
+      if (old) { if (on) old.enabled = true; else old.stop() }
+      this.emit('state', this.state())
+      return
+    }
+    this.emit('state', this.state())
+    let fresh
+    try {
+      fresh = await navigator.mediaDevices.getUserMedia({ video: this.#videoConstraints() })
+    } catch (err) {
+      if (ticket === this.#videoTicket) {
+        this.videoEnabled = false
+        this.emit('error', describeMediaError(err))
+        this.emit('state', this.state())
+      }
+      return
+    }
+    const newTrack = fresh.getVideoTracks()[0]
+    // Turned off again, or on twice, while this camera was starting.
+    if (ticket !== this.#videoTicket || !this.videoEnabled || !newTrack) {
+      for (const t of fresh.getTracks()) t.stop()
+      return
+    }
+    const merged = new MediaStream([...this.stream.getTracks().filter((t) => t.kind !== 'video'), newTrack])
+    this.stream = merged
+    this.emit('track', [{ kind: 'video', oldTrack: old, newTrack }])
+    this.emit('stream', merged)
     this.emit('state', this.state())
   }
 
@@ -241,16 +283,19 @@ export class LocalMedia extends Emitter {
     this.#deviceIds[kind] = deviceId
     if (!this.stream) return null
 
-    const wantAudio = this.stream.getAudioTracks().length > 0
-    const wantVideo = this.stream.getVideoTracks().length > 0
+    // Ask for the one device being switched, and nothing else: asking for
+    // both and keeping one left the other capturing, unseen, for good.
+    const type = kind === 'audioinput' ? 'audio' : 'video'
+    const current = this.stream[type === 'audio' ? 'getAudioTracks' : 'getVideoTracks']()[0]
+    if (!current) return []
+    // A camera that is off stays off: the choice is kept for when it is
+    // turned on again, which asks for this device.
+    if (type === 'video' && !this.videoEnabled) return []
 
-    const fresh = await navigator.mediaDevices.getUserMedia({
-      audio: wantAudio ? this.#audioConstraints() : false,
-      video: wantVideo ? this.#videoConstraints() : false,
-    })
+    const fresh = await navigator.mediaDevices.getUserMedia(
+      type === 'audio' ? { audio: this.#audioConstraints() } : { video: this.#videoConstraints() })
 
     const swaps = []
-    const type = kind === 'audioinput' ? 'audio' : 'video'
     const oldTrack = this.stream[type === 'audio' ? 'getAudioTracks' : 'getVideoTracks']()[0]
     const newTrack = fresh[type === 'audio' ? 'getAudioTracks' : 'getVideoTracks']()[0]
 

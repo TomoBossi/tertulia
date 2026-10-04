@@ -67,10 +67,10 @@ async function populateDevices() {
   }
 }
 
-$('#camera-select').addEventListener('change', async (e) => {
-  await media.useDevice('videoinput', e.target.value)
-  $('#preview').srcObject = media.stream
-})
+$('#camera-select').addEventListener('change', (e) => media.useDevice('videoinput', e.target.value))
+// A new camera — another device, or the camera turned back on, which starts
+// it afresh — comes as a new stream: the preview follows it.
+media.on('stream', (stream) => { $('#preview').srcObject = stream })
 $('#mic-select').addEventListener('change', (e) => media.useDevice('audioinput', e.target.value))
 
 $('#preview-mic').addEventListener('click', () => { media.toggleAudio(); syncPreview() })
