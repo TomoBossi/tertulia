@@ -226,10 +226,15 @@ async function enterCall(code, nick) {
   session.on('chat', (msg) => { float.append(msg); recordChat(msg) })
   session.on('notice', (text) => { float.system(text); recordChat({ system: true, text }) })
 
-  if (media.stream) {
+  // Join can be pressed while the preview is still waiting for the camera;
+  // it is sent the moment it arrives rather than only if it already had.
+  const sendCamera = () => {
+    if (!media.stream) return
     room.addStream(media.stream, { kind: 'camera' })
     session.speakers.add('self', media.stream)
   }
+  if (media.stream) sendCamera()
+  else void previewing.then(() => { sendCamera(); render() })
 
   render()
   flashChrome()
@@ -676,6 +681,7 @@ document.addEventListener('click', () => {
 // ------------------------------------------------------------------ start
 
 syncPreview()
-startPreview()
+/** The camera being asked for on the landing screen; the call waits on it if it is joined first. */
+const previewing = startPreview()
 
 addEventListener('beforeunload', () => session?.leave())
