@@ -22,6 +22,11 @@
  *     after a pair is nominated, renegotiation moves the ufrag underneath one
  *     in flight, and the same candidate arrives twice when two relays both
  *     deliver it. None of that is a reason to end a call.
+ *
+ * One addition, for what the reference cannot untangle in Chromium: once the
+ * channel is open, the polite peer asks for a turn before it offers, so the
+ * two sides' offers never cross (see #askTurn). The collision rules stay, for
+ * the handshake and for anything that slips past.
  */
 
 /** Role, decided by comparing ids, so both sides always agree without asking. */
@@ -85,6 +90,13 @@ export function iceConfiguration(rtcConfig) {
  * which cannot start until this one is let go. The room holds the peer's
  * place meanwhile, so letting go early costs a reconnection, not the person.
  */
+/**
+ * How long the polite side waits for the turn before asking again, and how
+ * long the impolite side holds its own offers for an offer that does not come.
+ */
+const TURN_RETRY_MS = 1000
+const TURN_LEND_MS = 5000
+
 export const DEFAULT_REPAIR = { restartAfterMs: 2000, giveUpMs: 8000 }
 
 /**
@@ -122,6 +134,14 @@ export class Link {
   #emit
   #log
   #makingOffer = false
+  /** Polite: a turn to offer has been asked for and not yet given. */
+  #turnAsked = null
+  /** Impolite: asked for a turn while busy, to be given once stable. */
+  #turnOwed = false
+  /** Impolite: the turn is lent out; our own offers wait until it is back. */
+  #lent = null
+  /** Impolite: an offer of ours that waited for the turn to come back. */
+  #offerHeld = false
   #ignoringOffer = false
   #settingRemoteAnswer = false
   #pendingCandidates = []
@@ -268,20 +288,21 @@ export class Link {
   #wire() {
     const pc = this.pc
 
-    pc.onnegotiationneeded = async () => {
+    pc.onnegotiationneeded = () => {
       // Without trickle the description is carried once, by the rendezvous, and
       // there is no path for a later one. Media added after the fact simply
       // is not renegotiated rather than producing an offer nobody receives.
       if (!this.trickle) return
-      try {
-        this.#makingOffer = true
-        await pc.setLocalDescription()
-        this.#send({ type: 'description', description: pc.localDescription })
-      } catch (err) {
-        this.#log('negotiation-failed', err?.message ?? String(err))
-      } finally {
-        this.#makingOffer = false
+      if (this.polite) return this.#askTurn()
+      if (this.#lent) {
+        this.#offerHeld = true
+        return
       }
+      void this.#offer()
+    }
+
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState === 'stable' && this.#turnOwed) this.#lendTurn()
     }
 
     pc.onicecandidate = ({ candidate }) => {
@@ -363,7 +384,7 @@ export class Link {
       } catch {
         return
       }
-      this.#emit('message', this.peerId, parsed)
+      this.#emit('message', this.peerId, parsed, this)
     }
   }
 
@@ -396,6 +417,73 @@ export class Link {
     clearTimeout(this.#giveUpTimer)
     this.#restartTimer = null
     this.#giveUpTimer = null
+  }
+
+  /**
+   * Make an offer and send it. Only ever while the turn is ours: the impolite
+   * side whenever it has not lent the turn out, the polite side once it has
+   * been given it.
+   */
+  async #offer() {
+    try {
+      this.#makingOffer = true
+      await this.pc.setLocalDescription()
+      this.#send({ type: 'description', description: this.pc.localDescription })
+    } catch (err) {
+      this.#log('negotiation-failed', err?.message ?? String(err))
+    } finally {
+      this.#makingOffer = false
+    }
+  }
+
+  /**
+   * Polite: ask the impolite side for a turn to offer, instead of offering.
+   *
+   * Two offers that cross cannot be untangled in Chromium once their media
+   * differ. The one that yields is rolled back, but the media sections it
+   * numbered keep their RTP header extension ids, so the other offer, which
+   * numbers the same sections differently, is refused ("RTP extension ID
+   * reassignment not supported") — and after that neither side can apply the
+   * other's offer, the media never flows, and the next track added crashes the
+   * page. Offers that never cross need no untangling: the impolite side offers
+   * freely, and the polite one only when handed the turn. Asked again if the
+   * answer is lost.
+   */
+  #askTurn() {
+    if (this.#turnAsked || this.dead) return
+    this.#send({ type: 'turn' })
+    this.#turnAsked = setTimeout(() => {
+      this.#turnAsked = null
+      this.#log('turn-retry', 'no answer to a request for the turn')
+      this.#askTurn()
+    }, TURN_RETRY_MS)
+  }
+
+  /**
+   * Impolite: hand the turn over, once nothing of ours is in flight, and hold
+   * our own offers until the polite side's offer has been answered. Taken
+   * back after a while in case that offer never comes.
+   */
+  #lendTurn() {
+    if (this.pc.signalingState !== 'stable' || this.#makingOffer) {
+      this.#turnOwed = true
+      return
+    }
+    this.#turnOwed = false
+    clearTimeout(this.#lent)
+    this.#lent = setTimeout(() => this.#turnBack('the lent turn was never used'), TURN_LEND_MS)
+    this.#send({ type: 'your-turn' })
+  }
+
+  #turnBack(why) {
+    if (!this.#lent) return
+    clearTimeout(this.#lent)
+    this.#lent = null
+    if (why) this.#log('turn-back', why)
+    if (this.#offerHeld && !this.dead) {
+      this.#offerHeld = false
+      void this.#offer()
+    }
   }
 
   /**
@@ -443,12 +531,33 @@ export class Link {
       }
 
       if (msg.type === 'candidate') {
+        // Sent the moment it is found, a candidate can overtake the description
+        // it belongs to. It waits for it rather than being thrown away.
+        if (!this.pc.remoteDescription && !this.#ignoringOffer) {
+          this.#pendingCandidates.push(msg.candidate)
+          return
+        }
         try {
           await this.pc.addIceCandidate(msg.candidate)
         } catch (err) {
           // Expected while an offer is being ignored, and harmless otherwise.
           if (!this.#ignoringOffer) this.#log('candidate-dropped', err?.name ?? 'error')
         }
+        return
+      }
+
+      if (msg.type === 'turn') {
+        if (!this.polite) this.#lendTurn()
+        return
+      }
+
+      if (msg.type === 'your-turn') {
+        if (!this.polite) return
+        clearTimeout(this.#turnAsked)
+        this.#turnAsked = null
+        // Offered even if nothing is left to negotiate: the impolite side is
+        // holding its own offers until ours is answered.
+        await this.#offer()
         return
       }
 
@@ -483,6 +592,8 @@ export class Link {
       if (description.type === 'offer') {
         await this.pc.setLocalDescription()
         this.#send({ type: 'description', description: this.pc.localDescription })
+        // The offer the turn was lent for is answered: the turn is ours again.
+        if (!this.polite) this.#turnBack()
       }
     } catch (err) {
       // Logged, not fatal. The connection state machine decides what is
@@ -557,6 +668,8 @@ export class Link {
 
   die(why) {
     if (this.dead) return
+    clearTimeout(this.#turnAsked)
+    clearTimeout(this.#lent)
     clearTimeout(this.#restartTimer)
     clearTimeout(this.#giveUpTimer)
     clearTimeout(this.#stallTimer)

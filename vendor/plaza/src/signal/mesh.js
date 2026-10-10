@@ -574,12 +574,12 @@ export function joinRoom(
     }
 
     if (event === 'message') {
-      const [data] = rest
-      handleMessage(peerId, data)
+      const [data, via] = rest
+      handleMessage(peerId, data, via)
     }
   }
 
-  const handleMessage = (peerId, data) => {
+  const handleMessage = (peerId, data, via = null) => {
     if (data?.__plaza === 'ping') {
       links.get(peerId)?.send({ __plaza: 'pong', id: data.id })
       return
@@ -592,7 +592,14 @@ export function joinRoom(
       return
     }
     if (data?.__plaza === 'signal') {
-      if (firstCopy(data.sid)) void links.get(peerId)?.accept(data.msg)
+      // A signal renegotiates the connection whose channel carried it. While
+      // two crossing introductions settle, the two ends can each be holding
+      // a different one as the peer's link for a moment, and a signal handed
+      // to the other one is lost to the connection it was for.
+      if (!firstCopy(data.sid)) return
+      const link = via && !via.dead ? via : links.get(peerId)
+      if (via && link !== links.get(peerId)) note(peerId, 'signal-on-contender', data.msg?.type ?? 'signal')
+      void link?.accept(data.msg)
       return
     }
     if (data?.__plaza === 'relay') {
