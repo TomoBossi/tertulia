@@ -10,10 +10,13 @@ import { Emitter } from './emitter.js'
  *
  * Two decisions worth knowing about:
  *
- * **Muting disables tracks, it does not stop them.** Setting `track.enabled =
- * false` keeps the connection intact and transmits silence or black frames.
- * Stopping the track instead would tear down and renegotiate the peer
- * connection on every mute, and the camera light would flicker off and on.
+ * **Off either releases a device or keeps it open, as the application
+ * chooses** (`release`). Released, the track is stopped and the device let go
+ * — the camera light and the system's microphone indicator go out — and
+ * turning it on asks for a fresh track, swapped in place. Kept open, the
+ * track is only disabled: it sends silence or black frames, and comes back
+ * instantly, with no new permission asked for. By default the camera is
+ * released and the microphone kept open.
  *
  * **Screen share is a second stream, not a replacement.** Swapping your camera
  * track for the screen would make you vanish from the call while presenting.
@@ -32,8 +35,22 @@ export class LocalMedia extends Emitter {
   videoEnabled = true
 
   #deviceIds = { audioinput: null, videoinput: null }
-  #videoTicket = 0
+  #tickets = { audio: 0, video: 0 }
   #devicesBound = false
+  #release
+
+  /**
+   * @param {object} [options]
+   * @param {{audio?: boolean, video?: boolean}} [options.release] whether
+   *   turning the microphone or camera off releases the device (true) or only
+   *   mutes its track and keeps it open (false). Defaults: camera released,
+   *   microphone kept open — a muted microphone unmutes instantly, a camera
+   *   left capturing is felt, on a phone especially.
+   */
+  constructor({ release = {} } = {}) {
+    super()
+    this.#release = { audio: false, video: true, ...release }
+  }
 
   /** True when this browser can share a screen at all. */
   static get canShareScreen() {
@@ -107,6 +124,11 @@ export class LocalMedia extends Emitter {
 
     for (const track of stream.getAudioTracks()) track.enabled = this.audioEnabled
     for (const track of stream.getVideoTracks()) track.enabled = this.videoEnabled
+    // A released device that is off is not left open by a new stream.
+    for (const track of stream.getTracks()) {
+      const on = track.kind === 'audio' ? this.audioEnabled : this.videoEnabled
+      if (!on && this.#release[track.kind]) track.stop()
+    }
 
     if (previous) {
       for (const track of previous.getTracks()) track.stop()
@@ -123,55 +145,58 @@ export class LocalMedia extends Emitter {
     this.emit('stream', null)
   }
 
-  setAudioEnabled(on) {
-    this.audioEnabled = on
-    for (const track of this.stream?.getAudioTracks() ?? []) track.enabled = on
-    this.emit('state', this.state())
-  }
+  /** Turn the microphone on or off; see `release`. */
+  setAudioEnabled(on) { return this.#setEnabled('audio', on) }
+
+  /** Turn the camera on or off; see `release`. */
+  setVideoEnabled(on) { return this.#setEnabled('video', on) }
 
   /**
-   * Turn the camera on or off.
+   * Off stops a released device's track, which lets the device go: a track
+   * that is only disabled keeps capturing what nobody receives. The stopped
+   * track stays in the stream, so whatever sends it keeps its place. A
+   * device kept open is only disabled, and enabled again.
    *
-   * Off stops the camera track, which releases the camera itself: a track
-   * that is only disabled keeps the camera capturing frames nobody sees, and
-   * on a phone you can feel it. The stopped track stays in the stream, so
-   * whatever sends it keeps its place.
-   *
-   * On asks for a fresh camera and announces it the way switching devices
-   * does — a `track` swap, then the new `stream` — so senders replace the
-   * track in place and nothing renegotiates. Starting a camera takes a
-   * moment; a quick off-on-off never leaves one running.
+   * On asks for a fresh track for a released device and announces it the way
+   * switching devices does — a `track` swap, then the new `stream` — so
+   * senders replace the track in place and nothing renegotiates. Starting a
+   * device takes a moment; a quick off-on-off never leaves one running.
    */
-  async setVideoEnabled(on) {
-    this.videoEnabled = on
-    const ticket = ++this.#videoTicket
-    const old = this.stream?.getVideoTracks()[0]
+  async #setEnabled(kind, on) {
+    const flag = kind === 'audio' ? 'audioEnabled' : 'videoEnabled'
+    this[flag] = on
+    const ticket = ++this.#tickets[kind]
+    const old = this.stream?.[kind === 'audio' ? 'getAudioTracks' : 'getVideoTracks']()[0]
     if (!on || !old || old.readyState === 'live') {
-      if (old) { if (on) old.enabled = true; else old.stop() }
+      if (old) {
+        if (on || !this.#release[kind]) old.enabled = on
+        else old.stop()
+      }
       this.emit('state', this.state())
       return
     }
     this.emit('state', this.state())
     let fresh
     try {
-      fresh = await navigator.mediaDevices.getUserMedia({ video: this.#videoConstraints() })
+      fresh = await navigator.mediaDevices.getUserMedia(
+        kind === 'audio' ? { audio: this.#audioConstraints() } : { video: this.#videoConstraints() })
     } catch (err) {
-      if (ticket === this.#videoTicket) {
-        this.videoEnabled = false
-        this.emit('error', describeMediaError(err))
+      if (ticket === this.#tickets[kind]) {
+        this[flag] = false
+        this.emit('error', describeMediaError(err, { [kind]: true }))
         this.emit('state', this.state())
       }
       return
     }
-    const newTrack = fresh.getVideoTracks()[0]
-    // Turned off again, or on twice, while this camera was starting.
-    if (ticket !== this.#videoTicket || !this.videoEnabled || !newTrack) {
+    const newTrack = fresh.getTracks().find((t) => t.kind === kind)
+    // Turned off again, or on twice, while this device was starting.
+    if (ticket !== this.#tickets[kind] || !this[flag] || !newTrack) {
       for (const t of fresh.getTracks()) t.stop()
       return
     }
-    const merged = new MediaStream([...this.stream.getTracks().filter((t) => t.kind !== 'video'), newTrack])
+    const merged = new MediaStream([...this.stream.getTracks().filter((t) => t.kind !== kind), newTrack])
     this.stream = merged
-    this.emit('track', [{ kind: 'video', oldTrack: old, newTrack }])
+    this.emit('track', [{ kind, oldTrack: old, newTrack }])
     this.emit('stream', merged)
     this.emit('state', this.state())
   }
@@ -288,9 +313,9 @@ export class LocalMedia extends Emitter {
     const type = kind === 'audioinput' ? 'audio' : 'video'
     const current = this.stream[type === 'audio' ? 'getAudioTracks' : 'getVideoTracks']()[0]
     if (!current) return []
-    // A camera that is off stays off: the choice is kept for when it is
-    // turned on again, which asks for this device.
-    if (type === 'video' && !this.videoEnabled) return []
+    // A released device that is off stays off: the choice is kept for when
+    // it is turned on again, which asks for this device.
+    if (this.#release[type] && !(type === 'audio' ? this.audioEnabled : this.videoEnabled)) return []
 
     const fresh = await navigator.mediaDevices.getUserMedia(
       type === 'audio' ? { audio: this.#audioConstraints() } : { video: this.#videoConstraints() })
