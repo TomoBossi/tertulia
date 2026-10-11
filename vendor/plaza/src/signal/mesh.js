@@ -1083,6 +1083,18 @@ export function joinRoom(
       }
     },
 
+    /**
+     * A peer is known to be gone, though no goodbye arrived: stop looking for
+     * them and close whatever connection is left, open or not, without
+     * reporting it as a failure.
+     */
+    gone(peerId) {
+      this.forget(peerId)
+      const link = links.get(peerId)
+      links.delete(peerId)
+      link?.die('peer left room')
+    },
+
     async ping(peerId) {
       const link = links.get(peerId)
       if (!link || !link.open) throw new Error(`no active peer with id ${peerId}`)

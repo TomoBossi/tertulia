@@ -109,12 +109,13 @@ export class Room extends Emitter {
   #readmitMs = 30000
   #held = new Map() // peerId -> { timer, reason }
 
-  constructor(signalRoom, { presence = {}, readmitMs = 30000 } = {}) {
+  constructor(signalRoom, { presence = {}, readmitMs = 30000, remember = null } = {}) {
     super()
     this.#room = signalRoom
     this.presence = { ...presence }
     this.#readmitMs = readmitMs
     this.selfId = signalRoom.selfId ?? defaultSelfId
+    this.#rememberEarlier(remember)
 
     this.#wirePresence()
     this.#wireStreams()
@@ -168,6 +169,7 @@ export class Room extends Emitter {
     const tr = joinRoom(config, name)
     const roomInstance = new Room(tr, {
       presence: initial, ...(readmitMs != null ? { readmitMs } : {}),
+      remember: `plaza:earlier:${appId}:${name}`,
     })
 
     // Keys and topics resolve asynchronously; waiting means a caller that
@@ -195,6 +197,16 @@ export class Room extends Emitter {
     this.#who = this.#room.makeAction('plz.who')
     this.#who.onMessage = (_data, { peerId }) => this.#announce(peerId)
 
+    // A peer telling us which of the peers we know were earlier pages of its
+    // own tab; see #rememberEarlier.
+    this.#was = this.#room.makeAction('plz.was')
+    this.#was.onMessage = (data, { peerId }) => {
+      const ids = Array.isArray(data?.ids) ? data.ids.filter((id) => typeof id === 'string') : []
+      for (const id of ids.slice(0, EARLIER_MAX)) {
+        if (id !== peerId && id !== this.selfId) void this.#gone(id, peerId)
+      }
+    }
+
     this.#hello.onMessage = (data, { peerId }) => {
       this.#heard.add(peerId)
       const peer = this.#ensure(peerId)
@@ -209,6 +221,8 @@ export class Room extends Emitter {
   #hello
   #unstream
   #who
+  #was
+  #earlier = [] // our own peer ids from earlier pages of this tab, in this room
   #heard = new Set()
   #helloChecks = new Map() // peerId -> timer
 
@@ -276,6 +290,67 @@ export class Room extends Emitter {
 
   #announce(target) {
     this.#hello.send(this.presence, target ? { target } : undefined).catch(() => {})
+    // Sent with every hello, so it is retried whenever a hello is.
+    if (this.#earlier.length) {
+      this.#was.send({ ids: this.#earlier }, target ? { target } : undefined).catch(() => {})
+    }
+  }
+
+  /**
+   * Make a goodbye that went missing arrive late instead of never.
+   *
+   * Leaving says goodbye with one message, sent as the page goes away. On a
+   * bad connection that message and the connection's own close are both
+   * easily lost, and then the others can only see a connection that failed:
+   * they hold the place of someone who is, in fact, already back as a new
+   * peer after a reload, and show both.
+   *
+   * So the tab remembers its peer id as the page goes, and the next page in
+   * the same tab tells everyone, over its own fresh connection, that the old
+   * id was its own and is gone. Written as the page goes rather than when it
+   * joins, so a duplicated tab, which copies this storage, never claims the
+   * place of the live page it was copied from.
+   */
+  #rememberEarlier(key) {
+    let storage = null
+    try { storage = key ? globalThis.sessionStorage ?? null : null } catch { /* blocked */ }
+    if (!storage) return
+    try {
+      const saved = JSON.parse(storage.getItem(key) ?? '[]')
+      if (Array.isArray(saved)) this.#earlier = saved.filter((id) => typeof id === 'string').slice(-EARLIER_MAX)
+      storage.removeItem(key)
+    } catch { /* unreadable: nothing to say */ }
+    globalThis.addEventListener?.('pagehide', () => {
+      try {
+        const saved = JSON.parse(storage.getItem(key) ?? '[]')
+        const ids = [...(Array.isArray(saved) ? saved : []), ...this.#earlier, this.selfId]
+        storage.setItem(key, JSON.stringify([...new Set(ids)].slice(-EARLIER_MAX)))
+      } catch { /* full or blocked: the goodbye is all there is */ }
+    })
+  }
+
+  /**
+   * A peer says an id we know was an earlier page of theirs, now gone.
+   *
+   * Someone whose place is held is let go at once. Someone still looking
+   * connected is asked first — a connection to a page that is gone can look
+   * alive for half a minute — and kept if they answer.
+   */
+  async #gone(peerId, by) {
+    const peer = this.peers.get(peerId)
+    if (!peer || this.#left) return
+    if (!this.#held.has(peerId) && (await this.ping(peerId)) != null) {
+      this.#note(peerId, 'still-here', `${by} says this was them, but it answers`)
+      return
+    }
+    if (this.peers.get(peerId) !== peer) return
+    const held = this.#held.get(peerId)
+    if (held) clearTimeout(held.timer)
+    this.#held.delete(peerId)
+    peer.reconnecting = false
+    peer.net = { ...peer.net, state: 'closed' }
+    this.#room.gone?.(peerId)
+    this.#release(peer, new Error(`left, as ${by} said on returning`))
   }
 
   // ------------------------------------------------------------------- peers
@@ -1110,6 +1185,9 @@ export class Room extends Emitter {
  * renegotiation on a slow path.
  */
 const STALE_STREAM_MS = 6000
+
+/** How many earlier pages of a tab are remembered, and accepted from a peer. */
+const EARLIER_MAX = 4
 
 /** How long to wait for a peer's hello before asking again, and how often. */
 const HELLO_WAIT_MS = 2000
